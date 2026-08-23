@@ -255,7 +255,7 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     message_lines = [f"🚀 <b>Trigger Crossed — {key_suffix}</b>"]
     for row in newly_triggered:
-        tgt_hit = row.get('TGT HIT', '-')
+        tgt_hit = row.get('STATUS', '-')
         message_lines.append(
             f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
             f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}  ›  TGT: {row['TGT']:.2f}\n"
@@ -479,7 +479,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
 
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
 
-    # TGT HIT column
+    # STATUS column (TGT HIT / -)
     def calculate_tgt_hit(row):
         try:
             if row['ltp'] > 0 and row['ltp'] >= row['TGT']:
@@ -488,7 +488,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
         except:
             return '-'
 
-    df['TGT HIT'] = df.apply(calculate_tgt_hit, axis=1)
+    df['STATUS'] = df.apply(calculate_tgt_hit, axis=1)
 
     # --- Telegram Trigger Alerts ---
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id)
@@ -500,7 +500,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
-    display_cols = ['Symbol', 'StrikePrice', 'Trigger', 'TGT', 'ltp', 'change %', 'TGT HIT']
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'TGT', 'change %', 'STATUS']
 
     def color_change(val):
         if isinstance(val, (int, float)):
@@ -512,7 +512,8 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
 
     def color_tgt_hit(val):
         if val == 'TGT HIT':
-            return 'background-color: darkgreen; color: white'
+            # Mild purple highlight
+            return 'background-color: #c9a3e0; color: black'
         return ''
 
     format_dict = {
@@ -529,7 +530,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
         st.dataframe(
             calls_df[display_cols].style
             .map(color_change, subset=['change %'])
-            .map(color_tgt_hit, subset=['TGT HIT'])
+            .map(color_tgt_hit, subset=['STATUS'])
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
             hide_index=True,
@@ -542,7 +543,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
         st.dataframe(
             puts_df[display_cols].style
             .map(color_change, subset=['change %'])
-            .map(color_tgt_hit, subset=['TGT HIT'])
+            .map(color_tgt_hit, subset=['STATUS'])
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
             hide_index=True,
