@@ -255,11 +255,11 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     message_lines = [f"🚀 <b>Trigger Crossed — {key_suffix}</b>"]
     for row in newly_triggered:
-        tgt_hit = row.get('STATUS', '-')
         message_lines.append(
             f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
-            f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}  ›  TGT: {row['TGT']:.2f}\n"
-            f"Change: {row['change %']:.2f}%   |   TGT Status: {tgt_hit}"
+            f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}\n"
+            f"TGT: {row['TGT']:.2f}  ›  SL: {row['SL']:.2f}\n"
+            f"Change: {row['change %']:.2f}%"
         )
 
     message = "\n".join(message_lines)
@@ -300,6 +300,7 @@ def process_iv_excel(excel_path, df_json, expiry_date):
         Lower Strike -> PE (Put) side
     Trigger = Close price x 2
     TGT     = Trigger x 2
+    SL      = Trigger / 2
     """
     try:
         df = pd.read_excel(excel_path)
@@ -370,6 +371,7 @@ def process_iv_excel(excel_path, df_json, expiry_date):
     # Trigger / Target calculation (User Rule)
     combined['Trigger'] = combined['Close'] * 2
     combined['TGT'] = combined['Trigger'] * 2
+    combined['SL'] = combined['Trigger'] / 2
 
     return combined.reset_index(drop=True)
 
@@ -479,17 +481,6 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
 
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
 
-    # STATUS column (TGT HIT / -)
-    def calculate_tgt_hit(row):
-        try:
-            if row['ltp'] > 0 and row['ltp'] >= row['TGT']:
-                return 'TGT HIT'
-            return '-'
-        except:
-            return '-'
-
-    df['STATUS'] = df.apply(calculate_tgt_hit, axis=1)
-
     # --- Telegram Trigger Alerts ---
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id)
 
@@ -500,39 +491,49 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
-    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'TGT', 'change %', 'STATUS']
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL']
 
     def color_change(val):
-        if isinstance(val, (int, float)):
-            if val >= 100:
-                return 'background-color: darkgreen; color: white'
-            elif val >= 90:
-                return 'background-color: lightgreen; color: black'
-        return ''
-
-    def color_tgt_hit(val):
-        if val == 'TGT HIT':
-            # Mild purple highlight
-            return 'background-color: #c9a3e0; color: black'
-        return ''
+        # Graduated green gradient - darker/more saturated as change % increases,
+        # matching a heatmap-style "Away %" column.
+        if not isinstance(val, (int, float)):
+            return ''
+        if val < 90:
+            return ''
+        vmin, vmax = 90.0, 500.0
+        ratio = min(max((val - vmin) / (vmax - vmin), 0.0), 1.0)
+        start = (198, 246, 213)  # light mint green
+        end = (11, 82, 20)       # deep forest green
+        r = int(start[0] + (end[0] - start[0]) * ratio)
+        g = int(start[1] + (end[1] - start[1]) * ratio)
+        b = int(start[2] + (end[2] - start[2]) * ratio)
+        text_color = 'white' if ratio > 0.45 else '#14532d'
+        return f'background-color: rgb({r},{g},{b}); color: {text_color}; font-weight: 700'
 
     format_dict = {
         'change %': '{:.2f}%',
         'Trigger': '{:.2f}',
         'TGT': '{:.2f}',
+        'SL': '{:.2f}',
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
     }
+
+    def render_table(data_df):
+        return (
+            data_df[display_cols].style
+            .map(color_change, subset=['change %'])
+            .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
+            .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
+            .format(format_dict)
+            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
+        )
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
         st.dataframe(
-            calls_df[display_cols].style
-            .map(color_change, subset=['change %'])
-            .map(color_tgt_hit, subset=['STATUS'])
-            .format(format_dict)
-            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
+            render_table(calls_df),
             hide_index=True,
             width='stretch',
             height=1800
@@ -541,11 +542,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     with col2:
         st.subheader("Lower Strike (PE)")
         st.dataframe(
-            puts_df[display_cols].style
-            .map(color_change, subset=['change %'])
-            .map(color_tgt_hit, subset=['STATUS'])
-            .format(format_dict)
-            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
+            render_table(puts_df),
             hide_index=True,
             width='stretch',
             height=1800
