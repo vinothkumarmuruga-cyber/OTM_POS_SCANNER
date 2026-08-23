@@ -78,9 +78,11 @@ META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 
-# The Monthly IV Excel (produced by the IV Sheet Generator) replaces the
-# old NSE Bhavcopy ZIP as the input file for this app.
+# The Monthly / Weekly IV Excel files (produced by the IV Sheet Generator's
+# Monthly and Weekly tabs) replace the old NSE Bhavcopy ZIP as the input
+# files for this app.
 MONTHLY_IV_FILE = os.path.join(DATA_DIR, 'monthly_iv.xlsx')
+WEEKLY_IV_FILE = os.path.join(DATA_DIR, 'weekly_iv.xlsx')
 
 def load_meta():
     if os.path.exists(META_FILE):
@@ -658,43 +660,72 @@ else:
 
         st.markdown("---")
 
-        # Monthly IV Excel Uploader (replaces the old Bhavcopy ZIP upload)
-        st.subheader("Monthly IV Excel")
-        up_iv = st.file_uploader(
-            "Upload Monthly IV Excel",
-            type=['xlsx'],
-            key='iv_up',
-            help="The output file from the IV Sheet Generator (e.g. 'Monthly IV 25AUG2026.xlsx')."
-        )
-        if up_iv is not None:
-            with open(MONTHLY_IV_FILE, "wb") as f:
-                f.write(up_iv.getvalue())
-            save_meta('MonthlyIVFileName', up_iv.name)
-
-            detected_expiry = extract_expiry_from_filename(up_iv.name)
-            if detected_expiry is not None:
-                save_meta('MonthlyIVExpiry', detected_expiry.strftime('%Y-%m-%d'))
-                st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
-            else:
-                st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
-
-        meta = load_meta()
-
-        if os.path.exists(MONTHLY_IV_FILE):
-            st.caption(f"📄 File: {meta.get('MonthlyIVFileName', 'monthly_iv.xlsx')}")
-
-            stored_expiry_str = meta.get('MonthlyIVExpiry')
-            try:
-                default_expiry_date = datetime.strptime(stored_expiry_str, '%Y-%m-%d').date() if stored_expiry_str else get_ist_now().date()
-            except Exception:
-                default_expiry_date = get_ist_now().date()
-
-            manual_expiry = st.date_input(
-                "Confirm Expiry Date",
-                value=default_expiry_date,
-                help="Must match the option expiry exactly, so it can be matched against NSE.json."
+        def render_iv_upload_section(section_key, file_path, meta_file_key, meta_expiry_key, label, example_name):
+            """
+            Renders one Upload + Confirm Expiry block (used for both the
+            Monthly IV Excel and the Weekly IV Excel sections below).
+            section_key keeps each block's widget keys independent so the
+            two sections never clash with each other.
+            """
+            st.subheader(label)
+            up_iv = st.file_uploader(
+                f"Upload {label}",
+                type=['xlsx'],
+                key=f'{section_key}_iv_up',
+                help=f"The output file from the IV Sheet Generator (e.g. '{example_name}')."
             )
-            save_meta('MonthlyIVExpiry', manual_expiry.strftime('%Y-%m-%d'))
+            if up_iv is not None:
+                with open(file_path, "wb") as f:
+                    f.write(up_iv.getvalue())
+                save_meta(meta_file_key, up_iv.name)
+
+                detected_expiry = extract_expiry_from_filename(up_iv.name)
+                if detected_expiry is not None:
+                    save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
+                    st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
+                else:
+                    st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
+
+            meta = load_meta()
+
+            if os.path.exists(file_path):
+                st.caption(f"📄 File: {meta.get(meta_file_key, os.path.basename(file_path))}")
+
+                stored_expiry_str = meta.get(meta_expiry_key)
+                try:
+                    default_expiry_date = datetime.strptime(stored_expiry_str, '%Y-%m-%d').date() if stored_expiry_str else get_ist_now().date()
+                except Exception:
+                    default_expiry_date = get_ist_now().date()
+
+                manual_expiry = st.date_input(
+                    "Confirm Expiry Date",
+                    value=default_expiry_date,
+                    key=f'{section_key}_expiry_input',
+                    help="Must match the option expiry exactly, so it can be matched against NSE.json."
+                )
+                save_meta(meta_expiry_key, manual_expiry.strftime('%Y-%m-%d'))
+
+        # Monthly IV Excel Uploader (replaces the old Bhavcopy ZIP upload)
+        render_iv_upload_section(
+            section_key='monthly',
+            file_path=MONTHLY_IV_FILE,
+            meta_file_key='MonthlyIVFileName',
+            meta_expiry_key='MonthlyIVExpiry',
+            label='Monthly IV Excel',
+            example_name='Monthly IV 25AUG2026.xlsx'
+        )
+
+        st.markdown("---")
+
+        # Weekly IV Excel Uploader
+        render_iv_upload_section(
+            section_key='weekly',
+            file_path=WEEKLY_IV_FILE,
+            meta_file_key='WeeklyIVFileName',
+            meta_expiry_key='WeeklyIVExpiry',
+            label='Weekly IV Excel',
+            example_name='Weekly IV 29AUG2026.xlsx'
+        )
 
         st.markdown("---")
         st.header("Auto Refresh")
@@ -706,30 +737,54 @@ st.title("OTM Positional Scanner")
 
 nse_json_df = load_nse_json()
 
-if not nse_json_df.empty:
-    st.header("Monthly OTM Options")
-
+def get_target_expiry(meta_expiry_key):
     meta = load_meta()
-    expiry_str = meta.get('MonthlyIVExpiry')
-    target_expiry = None
+    expiry_str = meta.get(meta_expiry_key)
     if expiry_str:
         try:
-            target_expiry = pd.to_datetime(expiry_str).normalize()
+            return pd.to_datetime(expiry_str).normalize()
         except Exception:
-            target_expiry = None
+            return None
+    return None
 
-    if os.path.exists(MONTHLY_IV_FILE) and target_expiry is not None:
-        st.info(f"📅 Displaying Expiry: **{target_expiry.strftime('%d-%b-%Y')}**")
+if not nse_json_df.empty:
+    tab_monthly, tab_weekly = st.tabs(["📅 Monthly", "🗓️ Weekly"])
 
-        run_every = refresh_interval if auto_refresh else None
+    with tab_monthly:
+        st.header("Monthly Options")
 
-        @st.fragment(run_every=run_every)
-        def show_monthly():
-            df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry)
-            display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id)
-        show_monthly()
-    else:
-        st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
+        target_expiry_m = get_target_expiry('MonthlyIVExpiry')
+
+        if os.path.exists(MONTHLY_IV_FILE) and target_expiry_m is not None:
+            st.info(f"📅 Displaying Expiry: **{target_expiry_m.strftime('%d-%b-%Y')}**")
+
+            run_every = refresh_interval if auto_refresh else None
+
+            @st.fragment(run_every=run_every)
+            def show_monthly():
+                df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
+                display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id)
+            show_monthly()
+        else:
+            st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
+
+    with tab_weekly:
+        st.header("Weekly Options")
+
+        target_expiry_w = get_target_expiry('WeeklyIVExpiry')
+
+        if os.path.exists(WEEKLY_IV_FILE) and target_expiry_w is not None:
+            st.info(f"📅 Displaying Expiry: **{target_expiry_w.strftime('%d-%b-%Y')}**")
+
+            run_every = refresh_interval if auto_refresh else None
+
+            @st.fragment(run_every=run_every)
+            def show_weekly():
+                df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
+                display_option_chain(df_w, access_token, "Weekly", telegram_enabled, telegram_bot_token, telegram_chat_id)
+            show_weekly()
+        else:
+            st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
 
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
