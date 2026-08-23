@@ -6,9 +6,10 @@ import os
 import time
 import gzip
 import shutil
+import json
+import re
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
-import zipfile
 
 # IST Offset
 IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -18,9 +19,9 @@ def get_ist_now():
     return datetime.now(IST)
 
 # Set page configuration
-st.set_page_config(page_title="Positional Stock Option Scanner", layout="wide")
+st.set_page_config(page_title="OTM Positional Scanner", layout="wide")
 
-# Custom CSS for compact layout and button-like tabs
+# Custom CSS for compact layout
 st.markdown("""
     <style>
         .block-container {
@@ -42,27 +43,7 @@ st.markdown("""
             padding-top: 0.1rem !important;
             margin-bottom: 0.1rem !important;
         }
-        
-        /* Tab Styling */
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 10px;
-        }
-        .stTabs [data-baseweb="tab"] {
-            height: 45px;
-            white-space: pre-wrap;
-            background-color: #f0f2f6;
-            border-radius: 5px;
-            padding: 10px 20px;
-            font-size: 1.1rem;
-            font-weight: 600;
-            border: 1px solid #d6d6d6;
-        }
-        .stTabs [aria-selected="true"] {
-            background-color: #007bff;
-            color: white !important;
-            border-color: #007bff;
-        }
-        
+
         /* Prevent graying out during refresh */
         .stApp {
             transition: none !important;
@@ -71,7 +52,7 @@ st.markdown("""
             opacity: 1 !important;
             transition: none !important;
         }
-        
+
         /* Hide File Uploader Instructions */
         [data-testid="stFileUploaderDropzone"] div div span {
            display: none !important;
@@ -79,16 +60,13 @@ st.markdown("""
         [data-testid="stFileUploaderDropzone"] div div small {
            display: none !important;
         }
-        
+
         /* Force Dataframe Font Weight */
         div[data-testid="stDataFrame"] {
             font-weight: 600 !important;
         }
     </style>
 """, unsafe_allow_html=True)
-
-import json
-import re
 
 # Paths for persistent storage
 DATA_DIR = 'data'
@@ -100,10 +78,9 @@ META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 
-FILES = {
-    'Monthly': os.path.join(DATA_DIR, 'monthly.csv'),
-    'Weekly': os.path.join(DATA_DIR, 'weekly.csv')
-}
+# The Monthly IV Excel (produced by the IV Sheet Generator) replaces the
+# old NSE Bhavcopy ZIP as the input file for this app.
+MONTHLY_IV_FILE = os.path.join(DATA_DIR, 'monthly_iv.xlsx')
 
 def load_meta():
     if os.path.exists(META_FILE):
@@ -114,10 +91,10 @@ def load_meta():
             pass
     return {}
 
-def save_meta(key, date_str):
+def save_meta(key, value):
     try:
         meta = load_meta()
-        meta[key] = date_str
+        meta[key] = value
         with open(META_FILE, 'w') as f:
             json.dump(meta, f)
     except:
@@ -141,32 +118,30 @@ def save_ltp_cache(new_data):
     except:
         pass
 
-def extract_date_from_filename(filename):
-    # Regex to find 8-digit date like 20260130
-    match = re.search(r'(\d{8})', filename)
+def extract_expiry_from_filename(filename):
+    """
+    Extract an expiry date from a filename like 'Monthly IV 25AUG2026.xlsx'
+    (produced by the IV Sheet Generator). Returns a normalized (midnight)
+    pandas Timestamp, or None if nothing could be parsed.
+    """
+    # DDMonYYYY e.g. 25AUG2026
+    match = re.search(r'(\d{1,2}[A-Za-z]{3}\d{4})', filename)
     if match:
-        d = match.group(1)
-        # Format as YYYY-MM-DD
-        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
-    return None
+        try:
+            return pd.to_datetime(match.group(1), format='%d%b%Y').normalize()
+        except Exception:
+            pass
 
-def extract_csv_from_zip(zip_file):
-    try:
-        # zip_file is a UploadedFile object from streamlit
-        with zipfile.ZipFile(zip_file) as z:
-            # Find the first CSV file in the ZIP
-            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
-            if not csv_files:
-                st.error("No CSV file found in the ZIP archive.")
-                return None, None
-            
-            # Extract the first CSV found
-            csv_filename = csv_files[0]
-            with z.open(csv_filename) as f:
-                return f.read(), csv_filename
-    except Exception as e:
-        st.error(f"Error extracting ZIP file: {e}")
-        return None, None
+    # Fallback: 8-digit date e.g. 20260825
+    match8 = re.search(r'(\d{8})', filename)
+    if match8:
+        d = match8.group(1)
+        try:
+            return pd.to_datetime(f"{d[:4]}-{d[4:6]}-{d[6:]}").normalize()
+        except Exception:
+            pass
+
+    return None
 
 def load_token():
     if os.path.exists(TOKEN_FILE):
@@ -197,8 +172,6 @@ def save_token(token):
 # Persisted to disk (not just st.session_state) so alert
 # de-duplication survives Streamlit Cloud restarts / fragment
 # reruns. Resets automatically each new trading day.
-# Each entry is "<tab>:<instrument_key>" so Monthly/Weekly
-# tabs track their own alert history independently.
 # ============================================================
 
 def load_trigger_alert_state():
@@ -246,9 +219,8 @@ def send_telegram_alert(bot_token, chat_id, message):
 
 def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_id):
     """
-    Sends a Telegram alert the moment an option's change %
-    (LTP / Trigger x 100) crosses 100% - i.e. LTP has crossed
-    the Trigger price. Fires once per option per tab per day.
+    Sends a Telegram alert the moment an option's LTP crosses its
+    Trigger price (change % >= 100). Fires once per option per day.
     """
     if not telegram_enabled:
         return
@@ -264,7 +236,7 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
-        if not inst_key:
+        if not inst_key or pd.isna(inst_key):
             continue
 
         alert_id = f"{key_suffix}:{inst_key}"
@@ -283,10 +255,11 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     message_lines = [f"🚀 <b>Trigger Crossed — {key_suffix}</b>"]
     for row in newly_triggered:
+        tgt_hit = row.get('TGT HIT', '-')
         message_lines.append(
             f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
-            f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}\n"
-            f"Change: {row['change %']:.2f}%"
+            f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}  ›  TGT: {row['TGT']:.2f}\n"
+            f"Change: {row['change %']:.2f}%   |   TGT Status: {tgt_hit}"
         )
 
     message = "\n".join(message_lines)
@@ -294,7 +267,7 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     if success:
         save_trigger_alert_state(alerted)
-        st.sidebar.success(f"Telegram alert sent for {len(newly_triggered)} trigger cross(es) on {key_suffix}.")
+        st.sidebar.success(f"Telegram alert sent for {len(newly_triggered)} trigger cross(es).")
     else:
         st.sidebar.warning(f"Telegram alert failed: {error}")
 
@@ -307,7 +280,6 @@ def load_nse_json():
     if os.path.exists(NSE_JSON_PATH):
         try:
             df = pd.read_json(NSE_JSON_PATH)
-            # Pre-process JSON
             if 'segment' in df.columns:
                 df = df[df['segment'] == 'NSE_FO']
             df['expiry_dt'] = pd.to_datetime(df['expiry'], unit='ms').dt.normalize()
@@ -319,138 +291,104 @@ def load_nse_json():
         st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
 
-def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
+
+def process_iv_excel(excel_path, df_json, expiry_date):
+    """
+    Reads the Monthly IV Excel (from the IV Sheet Generator) and builds the
+    OTM universe this scanner tracks:
+        Upper Strike -> CE (Call) side
+        Lower Strike -> PE (Put) side
+    Trigger = Close price x 2
+    TGT     = Trigger x 2
+    """
     try:
-        df_bhav = pd.read_csv(bhav_file)
-        
-        # Check required columns
-        required_cols = ['FinInstrmTp', 'TckrSymb', 'XpryDt', 'ClsPric', 'StrkPric', 'OptnTp', 'HghPric', 'LwPric', 'LastPric']
-        if not all(col in df_bhav.columns for col in required_cols):
-            st.error(f"Uploaded file missing required columns: {required_cols}")
-            return pd.DataFrame()
-
-        # --- Process Bhavcopy Futures ---
-        futures = df_bhav[df_bhav['FinInstrmTp'].isin(['STF', 'IDF'])].copy()
-        if futures.empty:
-            st.warning("No Futures data found in uploaded file.")
-            return pd.DataFrame()
-
-        futures['XpryDt'] = pd.to_datetime(futures['XpryDt'])
-        
-        # Filter out past expiries (Keep today and future)
-        # We use IST time to match the environment's expectation
-        ist_now = get_ist_now()
-        today = ist_now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
-        
-        futures = futures[futures['XpryDt'] >= today]
-        if futures.empty:
-            st.warning("No future expiries found in the uploaded file.")
-            return pd.DataFrame()
-
-        futures = futures.sort_values('XpryDt')
-        
-        # Identify unique expiry dates available in the bhavcopy
-        available_expiries = sorted(futures['XpryDt'].unique())
-        
-        if not available_expiries:
-            st.warning("No future expiry dates found in the uploaded file.")
-            return pd.DataFrame(), None, []
-
-        # Select target expiry based on index (0 for Near, 1 for Next)
-        if target_expiry_index >= len(available_expiries):
-            # Fallback to the latest available if index is out of range
-            target_expiry = available_expiries[-1]
-        else:
-            target_expiry = available_expiries[target_expiry_index]
-
-        # Filter futures for the target expiry per symbol
-        near_futures = futures[futures['XpryDt'] == target_expiry].copy()
-        
-        # If a symbol doesn't have the target expiry, it will be skipped
-        near_futures = near_futures[['TckrSymb', 'ClsPric', 'XpryDt']]
-        near_futures = near_futures.rename(columns={'ClsPric': 'FuturePrice', 'XpryDt': 'FutureExpiryDate'})
-
-        # --- Process Bhavcopy Options ---
-        options = df_bhav[df_bhav['OptnTp'].isin(['CE', 'PE'])].copy()
-        if options.empty:
-            st.warning("No Options data found in uploaded file.")
-            return pd.DataFrame(), target_expiry, available_expiries
-
-        options['XpryDt'] = pd.to_datetime(options['XpryDt'])
-
-        # Merge Options with selected Futures expiry
-        merged = pd.merge(options, near_futures, on='TckrSymb')
-        merged = merged[merged['XpryDt'] == merged['FutureExpiryDate']]
-        
-        # Calculate ATM
-        merged['Diff'] = abs(merged['StrkPric'] - merged['FuturePrice'])
-        
-        # Find best strike per symbol (Minimize Diff, then tie-break with StrikePrice)
-        # This ensures only ONE strike is selected per symbol, eliminating duplicates
-        best_strikes = merged[['TckrSymb', 'StrkPric', 'Diff']].drop_duplicates()
-        best_strikes = best_strikes.sort_values(by=['TckrSymb', 'Diff', 'StrkPric'])
-        best_strikes = best_strikes.groupby('TckrSymb').first().reset_index()
-        
-        atm_options = pd.merge(merged, best_strikes[['TckrSymb', 'StrkPric']], on=['TckrSymb', 'StrkPric'])
-        atm_rows = atm_options[['TckrSymb', 'XpryDt', 'StrkPric', 'OptnTp', 'FuturePrice', 'ClsPric', 'FinInstrmNm', 'HghPric', 'LwPric', 'LastPric']].copy()
-        
-        # Normalize dates for merging
-        atm_rows['XpryDt'] = atm_rows['XpryDt'].dt.normalize()
-
-        # Merge with Upstox JSON
-        result = pd.merge(
-            atm_rows,
-            df_json,
-            left_on=['TckrSymb', 'StrkPric', 'OptnTp', 'XpryDt'],
-            right_on=['underlying_symbol', 'strike_price', 'instrument_type', 'expiry_dt'],
-            how='inner'
-        )
-
-        if result.empty and not atm_rows.empty:
-            st.error("Data mismatch: Found options in Bhavcopy but couldn't find them in NSE.json. Please update NSE.json via the sidebar.")
-
-        final_df = result[[
-            'TckrSymb', 'XpryDt', 'StrkPric', 'OptnTp', 
-            'FuturePrice', 'ClsPric', 'instrument_key',
-            'HghPric', 'LwPric', 'LastPric'
-        ]]
-
-        final_df = final_df.rename(columns={
-            'TckrSymb': 'Symbol',
-            'XpryDt': 'ExpiryDate',
-            'StrkPric': 'StrikePrice',
-            'OptnTp': 'OptionType',
-            'ClsPric': 'Trigger',
-            'HghPric': 'HighPrice',
-            'LwPric': 'LowPrice',
-            'LastPric': 'LastPrice'
-        })
-
-        # Multiply Trigger by 2 (User Rule)
-        if 'Trigger' in final_df.columns:
-            final_df['Trigger'] = final_df['Trigger'] * 2
-            
-        return final_df, target_expiry, available_expiries
-
+        df = pd.read_excel(excel_path)
     except Exception as e:
-        st.error(f"Error processing file: {e}")
-        return pd.DataFrame(), None, []
+        st.error(f"Failed to read Monthly IV Excel: {e}")
+        return pd.DataFrame()
+
+    required_cols = ['NAME', 'UPPER STRIKE PRICE', 'UPPER STRIKE CLOSE PRICE',
+                      'LOWER STRIKE PRICE', 'LOWER STRIKE CLOSE PRICE']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Uploaded Excel missing required columns: {missing}")
+        return pd.DataFrame()
+
+    df = df.dropna(subset=['NAME'])
+
+    # Upper Strike -> CE leg
+    upper = df[['NAME', 'UPPER STRIKE PRICE', 'UPPER STRIKE CLOSE PRICE']].copy()
+    upper = upper.rename(columns={
+        'NAME': 'Symbol',
+        'UPPER STRIKE PRICE': 'StrikePrice',
+        'UPPER STRIKE CLOSE PRICE': 'Close'
+    })
+    upper['OptionType'] = 'CE'
+
+    # Lower Strike -> PE leg
+    lower = df[['NAME', 'LOWER STRIKE PRICE', 'LOWER STRIKE CLOSE PRICE']].copy()
+    lower = lower.rename(columns={
+        'NAME': 'Symbol',
+        'LOWER STRIKE PRICE': 'StrikePrice',
+        'LOWER STRIKE CLOSE PRICE': 'Close'
+    })
+    lower['OptionType'] = 'PE'
+
+    combined = pd.concat([upper, lower], ignore_index=True)
+    combined = combined.dropna(subset=['StrikePrice', 'Close'])
+    combined = combined[combined['StrikePrice'] > 0]
+
+    if combined.empty:
+        return pd.DataFrame()
+
+    combined['ExpiryDate'] = expiry_date
+    # Round to avoid float-precision mismatches on the merge key below
+    combined['StrikePrice'] = combined['StrikePrice'].round(2)
+
+    if df_json is None or df_json.empty:
+        st.warning("NSE.json not loaded — cannot map instrument keys / fetch live LTP.")
+        combined['instrument_key'] = None
+    else:
+        df_json = df_json.copy()
+        df_json['strike_price'] = df_json['strike_price'].astype(float).round(2)
+
+        merged = pd.merge(
+            combined,
+            df_json,
+            left_on=['Symbol', 'StrikePrice', 'OptionType', 'ExpiryDate'],
+            right_on=['underlying_symbol', 'strike_price', 'instrument_type', 'expiry_dt'],
+            how='left'
+        )
+        if merged['instrument_key'].isna().all() and not merged.empty:
+            st.error(
+                "Data mismatch: Could not find any of these strikes in NSE.json. "
+                "Check that the Expiry Date set in the sidebar matches this Monthly IV file, "
+                "or update NSE.json."
+            )
+        combined = merged[['Symbol', 'StrikePrice', 'OptionType', 'Close', 'instrument_key']]
+
+    # Trigger / Target calculation (User Rule)
+    combined['Trigger'] = combined['Close'] * 2
+    combined['TGT'] = combined['Trigger'] * 2
+
+    return combined.reset_index(drop=True)
+
 
 def fetch_ltp(instrument_keys, token):
     if not token:
         return {}
-    
+
     url = "https://api.upstox.com/v3/market-quote/ltp"
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {token}'
     }
-    
+
     batch_size = 50
     ltp_map = {}
-    
+
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
-    
+
     def fetch_batch(batch):
         params = {'instrument_key': ','.join(batch)}
         try:
@@ -469,7 +407,7 @@ def fetch_ltp(instrument_keys, token):
         except Exception:
             pass
         return {}
-    
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_batch, batch) for batch in batches]
         for future in concurrent.futures.as_completed(futures):
@@ -479,100 +417,91 @@ def fetch_ltp(instrument_keys, token):
                     ltp_map.update(batch_result)
             except Exception:
                 pass
-    
+
     return ltp_map
+
 
 def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, telegram_bot_token="", telegram_chat_id=""):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
-        st.info("No data to display. Please upload a valid Bhavcopy in the sidebar.")
+        st.info("No data to display. Please upload a valid Monthly IV Excel in the sidebar.")
         return
 
     # Fetch LTP if token provided
     if access_token:
         all_keys = df['instrument_key'].dropna().unique().tolist()
-        
-        # Time-based Fetch Logic
+
         ist_now = get_ist_now()
         current_time = ist_now.time()
         start_time = datetime.strptime("09:00", "%H:%M").time()
         end_time = datetime.strptime("15:40", "%H:%M").time()
-        
+
         is_market_hours = start_time <= current_time <= end_time
-        
-        # Load Cache
+
         ltp_cache = load_ltp_cache()
-        
-        # Identify missing keys
         missing_keys = [k for k in all_keys if k not in ltp_cache]
-        
-        # Check if user requested a manual refresh
+
         force_refresh = st.session_state.get('force_refresh_ltp', False)
-        
+
         should_fetch = False
-        fetch_reason = ""
-        
+
         if is_market_hours:
             should_fetch = True
-            fetch_reason = "Live Market Update"
         elif force_refresh:
             should_fetch = True
-            fetch_reason = "Manual Refresh"
-            # Reset the flag after planning to fetch
             st.session_state['force_refresh_ltp'] = False
         elif missing_keys:
             should_fetch = True
-            fetch_reason = "Populating Missing Data"
-        
-        ltp_data = {}
-        
+
         if should_fetch:
             keys_to_fetch = all_keys if is_market_hours else missing_keys
-            # Fetch silently
             fetched_data = fetch_ltp(keys_to_fetch, access_token)
             if fetched_data:
                 save_ltp_cache(fetched_data)
-                # Reload cache to get complete set
                 ltp_cache = load_ltp_cache()
-        
-        # Use data from cache
+
         ltp_data = {k: ltp_cache.get(k, 0.0) for k in all_keys}
-        
         df['ltp'] = df['instrument_key'].map(ltp_data).fillna(0.0)
     else:
         df['ltp'] = 0.0
         st.warning("Enter Access Token in sidebar to see live LTP.")
 
-    # Calculate Change %
+    # Calculate Change % (LTP vs Trigger)
     def calculate_numeric_change(row):
         try:
-            ocp = row['Trigger']
+            trigger = row['Trigger']
             ltp = row['ltp']
-            if ocp > 0 and ltp > 0:
-                return (ltp / ocp * 100)
+            if trigger > 0 and ltp > 0:
+                return (ltp / trigger * 100)
             return 0.0
         except:
             return 0.0
 
-    df['change_val'] = df.apply(calculate_numeric_change, axis=1)
-    df['change %'] = df['change_val']
+    df['change %'] = df.apply(calculate_numeric_change, axis=1)
+
+    # TGT HIT column
+    def calculate_tgt_hit(row):
+        try:
+            if row['ltp'] > 0 and row['ltp'] >= row['TGT']:
+                return 'TGT HIT'
+            return '-'
+        except:
+            return '-'
+
+    df['TGT HIT'] = df.apply(calculate_tgt_hit, axis=1)
 
     # --- Telegram Trigger Alerts ---
-    # Runs on the full (CE+PE) dataframe, after change % is
-    # computed, before the CE/PE split below.
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id)
 
-    # Split Calls/Puts
+    # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
     puts_df = df[df['OptionType'] == 'PE'].copy()
 
-    # Sort
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
-    display_cols = ['Symbol', 'StrikePrice', 'Trigger', 'ltp', 'change %']
-    
-    # Styling
+    display_cols = ['Symbol', 'StrikePrice', 'Trigger', 'TGT', 'ltp', 'change %', 'TGT HIT']
+
     def color_change(val):
         if isinstance(val, (int, float)):
             if val >= 100:
@@ -581,86 +510,78 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
                 return 'background-color: lightgreen; color: black'
         return ''
 
+    def color_tgt_hit(val):
+        if val == 'TGT HIT':
+            return 'background-color: darkgreen; color: white'
+        return ''
+
     format_dict = {
         'change %': '{:.2f}%',
         'Trigger': '{:.2f}',
+        'TGT': '{:.2f}',
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
     }
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Calls (CE)")
+        st.subheader("Upper Strike (CE)")
         st.dataframe(
             calls_df[display_cols].style
             .map(color_change, subset=['change %'])
+            .map(color_tgt_hit, subset=['TGT HIT'])
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
-            hide_index=True, 
-            use_container_width=True,
+            hide_index=True,
+            width='stretch',
             height=1800
         )
 
     with col2:
-        st.subheader("Puts (PE)")
+        st.subheader("Lower Strike (PE)")
         st.dataframe(
             puts_df[display_cols].style
             .map(color_change, subset=['change %'])
+            .map(color_tgt_hit, subset=['TGT HIT'])
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
-            hide_index=True, 
-            use_container_width=True,
+            hide_index=True,
+            width='stretch',
             height=1800
         )
 
 # --- Configuration Logic (Before Sidebar) ---
-# Check if we should enter "Client View" (No Sidebar, Token from Secrets)
-# To see the sidebar (Admin View), remove or comment out UPSTOX_ACCESS_TOKEN in .streamlit/secrets.toml
-is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
+# Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
+# (e.g. running locally without one configured) - default to Admin view in that case.
+try:
+    is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
+except Exception:
+    is_client_view = False
 
 if is_client_view:
-    # CLIENT VIEW DEFAULTS
     access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-    # Hide sidebar completely for clients
     st.markdown("""
     <style>
         [data-testid="stSidebar"] {display: none;}
     </style>
     """, unsafe_allow_html=True)
-    
-    # Default refresh settings for clients
+
     auto_refresh = True
     refresh_interval = 15
-    target_expiry_idx = 0 # Default to current month for clients
 
-    # Telegram config in client view comes from secrets only,
-    # since the sidebar (with its manual controls) is hidden.
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
-    
+
 else:
-    # ADMIN VIEW (Show Sidebar)
     with st.sidebar:
         st.header("Configuration")
-        
-        # Local Token Logic
+
         saved_token = load_token()
         access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
-        
+
         if access_token and access_token != saved_token:
             save_token(access_token)
-
-        st.markdown("---")
-        st.header("Expiry Settings")
-        # Expiry Selection for Monthly/Weekly
-        expiry_type = st.radio(
-            "Select Expiry Month",
-            options=["Current Month", "Next Month"],
-            index=0,
-            help="Choose which expiry month to display data for."
-        )
-        target_expiry_idx = 0 if expiry_type == "Current Month" else 1
 
         st.markdown("---")
         st.header("Telegram Alerts")
@@ -699,24 +620,23 @@ else:
             success, error = send_telegram_alert(
                 telegram_bot_token,
                 telegram_chat_id,
-                "✅ Test alert from Positional Option Scanner — Telegram is wired up correctly."
+                "✅ Test alert from OTM Positional Scanner — Telegram is wired up correctly."
             )
             if success:
                 st.success("Test message sent — check Telegram.")
             else:
                 st.error(f"Test message failed: {error}")
-    
+
         st.markdown("---")
         st.header("Data Management")
-        
-        # LTP Force Refresh
+
         if st.button("⚡ Refresh LTP Now", use_container_width=True):
             st.session_state['force_refresh_ltp'] = True
             st.rerun()
 
         # NSE JSON Uploader
         st.subheader("NSE Instrument JSON")
-        
+
         if st.button("🔄 Download Latest"):
             try:
                 with st.spinner("Downloading latest NSE.json from Upstox..."):
@@ -738,90 +658,80 @@ else:
             except Exception as e:
                 st.error(f"Error: {e}")
 
-        
-        # Monthly Uploader
-        st.subheader("Monthly")
-        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['zip'], key='m_up')
-        if up_m is not None:
-            csv_content, csv_name = extract_csv_from_zip(up_m)
-            if csv_content:
-                with open(FILES['Monthly'], "wb") as f:
-                    f.write(csv_content)
-                # Extract and save date from the CSV filename within the ZIP
-                date_str = extract_date_from_filename(csv_name)
-                if date_str:
-                    save_meta('Monthly', date_str)
-                st.success(f"Monthly file updated from {csv_name}!")
-        
-        meta = load_meta()
-        if 'Monthly' in meta and os.path.exists(FILES['Monthly']):
-            st.caption(f"📅 Data Date: {meta['Monthly']}")
-        elif os.path.exists(FILES['Monthly']):
-            # Fallback to file time if no meta date
-            m_time = os.path.getmtime(FILES['Monthly'])
-            st.caption(f"📅 Last Updated: {datetime.fromtimestamp(m_time).strftime('%Y-%m-%d %H:%M')}")
-        
-        # Weekly Uploader
-        st.subheader("Weekly")
-        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['zip'], key='w_up')
-        if up_w is not None:
-            csv_content, csv_name = extract_csv_from_zip(up_w)
-            if csv_content:
-                with open(FILES['Weekly'], "wb") as f:
-                    f.write(csv_content)
-                # Extract and save date
-                date_str = extract_date_from_filename(csv_name)
-                if date_str:
-                    save_meta('Weekly', date_str)
-                st.success(f"Weekly file updated from {csv_name}!")
+        st.markdown("---")
 
-        if 'Weekly' in meta and os.path.exists(FILES['Weekly']):
-            st.caption(f"📅 Data Date: {meta['Weekly']}")
-        elif os.path.exists(FILES['Weekly']):
-            w_time = os.path.getmtime(FILES['Weekly'])
-            st.caption(f"📅 Last Updated: {datetime.fromtimestamp(w_time).strftime('%Y-%m-%d %H:%M')}")
-            
+        # Monthly IV Excel Uploader (replaces the old Bhavcopy ZIP upload)
+        st.subheader("Monthly IV Excel")
+        up_iv = st.file_uploader(
+            "Upload Monthly IV Excel",
+            type=['xlsx'],
+            key='iv_up',
+            help="The output file from the IV Sheet Generator (e.g. 'Monthly IV 25AUG2026.xlsx')."
+        )
+        if up_iv is not None:
+            with open(MONTHLY_IV_FILE, "wb") as f:
+                f.write(up_iv.getvalue())
+            save_meta('MonthlyIVFileName', up_iv.name)
+
+            detected_expiry = extract_expiry_from_filename(up_iv.name)
+            if detected_expiry is not None:
+                save_meta('MonthlyIVExpiry', detected_expiry.strftime('%Y-%m-%d'))
+                st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
+            else:
+                st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
+
+        meta = load_meta()
+
+        if os.path.exists(MONTHLY_IV_FILE):
+            st.caption(f"📄 File: {meta.get('MonthlyIVFileName', 'monthly_iv.xlsx')}")
+
+            stored_expiry_str = meta.get('MonthlyIVExpiry')
+            try:
+                default_expiry_date = datetime.strptime(stored_expiry_str, '%Y-%m-%d').date() if stored_expiry_str else get_ist_now().date()
+            except Exception:
+                default_expiry_date = get_ist_now().date()
+
+            manual_expiry = st.date_input(
+                "Confirm Expiry Date",
+                value=default_expiry_date,
+                help="Must match the option expiry exactly, so it can be matched against NSE.json."
+            )
+            save_meta('MonthlyIVExpiry', manual_expiry.strftime('%Y-%m-%d'))
+
         st.markdown("---")
         st.header("Auto Refresh")
         auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
         refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 
 # --- Main Page ---
-st.title("Positional Stock Option Scanner")
-# st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+st.title("OTM Positional Scanner")
 
 nse_json_df = load_nse_json()
 
 if not nse_json_df.empty:
-    tab1, tab2 = st.tabs(["Monthly", "Weekly"])
-    
-    run_every = refresh_interval if auto_refresh else None
+    st.header("Monthly OTM Options")
 
-    with tab1:
-        st.header(f"Monthly Options ({expiry_type if not is_client_view else 'Current Month'})")
-        if os.path.exists(FILES['Monthly']):
-            @st.fragment(run_every=run_every)
-            def show_monthly():
-                df_m, target_exp, all_exps = process_bhavcopy(FILES['Monthly'], nse_json_df, target_expiry_index=target_expiry_idx)
-                if target_exp:
-                    st.info(f"📅 Displaying Expiry: **{target_exp.strftime('%d-%b-%Y')}**")
-                display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id)
-            show_monthly()
-        else:
-            st.warning("Monthly Bhavcopy file not found. Please upload in the sidebar.")
+    meta = load_meta()
+    expiry_str = meta.get('MonthlyIVExpiry')
+    target_expiry = None
+    if expiry_str:
+        try:
+            target_expiry = pd.to_datetime(expiry_str).normalize()
+        except Exception:
+            target_expiry = None
 
-    with tab2:
-        st.header(f"Weekly Options ({expiry_type if not is_client_view else 'Current Month'})")
-        if os.path.exists(FILES['Weekly']):
-            @st.fragment(run_every=run_every)
-            def show_weekly():
-                df_w, target_exp, all_exps = process_bhavcopy(FILES['Weekly'], nse_json_df, target_expiry_index=target_expiry_idx)
-                if target_exp:
-                    st.info(f"📅 Displaying Expiry: **{target_exp.strftime('%d-%b-%Y')}**")
-                display_option_chain(df_w, access_token, "Weekly", telegram_enabled, telegram_bot_token, telegram_chat_id)
-            show_weekly()
-        else:
-            st.warning("Weekly Bhavcopy file not found. Please upload in the sidebar.")
+    if os.path.exists(MONTHLY_IV_FILE) and target_expiry is not None:
+        st.info(f"📅 Displaying Expiry: **{target_expiry.strftime('%d-%b-%Y')}**")
+
+        run_every = refresh_interval if auto_refresh else None
+
+        @st.fragment(run_every=run_every)
+        def show_monthly():
+            df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry)
+            display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id)
+        show_monthly()
+    else:
+        st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
 
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
