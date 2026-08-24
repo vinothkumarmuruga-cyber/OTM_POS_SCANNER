@@ -269,9 +269,17 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     if success:
         save_trigger_alert_state(alerted)
-        st.sidebar.success(f"Telegram alert sent for {len(newly_triggered)} trigger cross(es).")
+        # st.toast (not st.sidebar.success/warning): this function runs inside an
+        # @st.fragment (show_monthly/show_weekly). Writing to st.sidebar - a
+        # container outside the fragment's own tree - from inside a fragment
+        # raises StreamlitAPIException ("container was not written to during
+        # the initial run") and aborts the fragment mid-run, which is why the
+        # option tables were disappearing whenever an alert fired. st.toast()
+        # is a floating overlay that doesn't need a reserved container, so it's
+        # safe to call from any fragment.
+        st.toast(f"📨 Telegram alert sent for {len(newly_triggered)} trigger cross(es) on {key_suffix}.", icon="✅")
     else:
-        st.sidebar.warning(f"Telegram alert failed: {error}")
+        st.toast(f"⚠️ Telegram alert failed ({key_suffix}): {error}", icon="⚠️")
 
 
 # Constant for NSE JSON
@@ -496,21 +504,15 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL']
 
     def color_change(val):
-        # Graduated green gradient - darker/more saturated as change % increases,
-        # matching a heatmap-style "Away %" column.
+        # Fixed two-tier coloring (no graduated/ascending scale):
+        # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
         if not isinstance(val, (int, float)):
             return ''
-        if val < 90:
-            return ''
-        vmin, vmax = 90.0, 500.0
-        ratio = min(max((val - vmin) / (vmax - vmin), 0.0), 1.0)
-        start = (198, 246, 213)  # light mint green
-        end = (11, 82, 20)       # deep forest green
-        r = int(start[0] + (end[0] - start[0]) * ratio)
-        g = int(start[1] + (end[1] - start[1]) * ratio)
-        b = int(start[2] + (end[2] - start[2]) * ratio)
-        text_color = 'white' if ratio > 0.45 else '#14532d'
-        return f'background-color: rgb({r},{g},{b}); color: {text_color}; font-weight: 700'
+        if val >= 100:
+            return 'background-color: darkgreen; color: white; font-weight: 700'
+        elif val >= 90:
+            return 'background-color: lightgreen; color: black; font-weight: 700'
+        return ''
 
     format_dict = {
         'change %': '{:.2f}%',
