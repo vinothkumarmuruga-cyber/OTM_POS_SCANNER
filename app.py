@@ -677,10 +677,27 @@ def handle_row_tick_to_log(data_df, key_suffix, leg_label, select_event):
 
 
 def render_trade_log_tab(access_token):
-    st.header("Trade Log")
-    st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+    header_col1, header_col2 = st.columns([5, 1])
+    with header_col1:
+        st.header("Trade Log")
+        st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 
     trades = load_trade_log()
+
+    with header_col2:
+        st.write("")  # vertical spacer to align the button with the header
+        if st.button("🧹 Clear All", key="clear_all_trades_btn", width='stretch', disabled=not trades):
+            save_trade_log([])
+            # Also forget which instrument_keys were already logged this
+            # session, so re-ticking the same row in the Monthly/Weekly
+            # tables logs it again instead of being silently ignored as
+            # "already logged".
+            for k in list(st.session_state.keys()):
+                if k.startswith('logged_ids_'):
+                    st.session_state[k] = set()
+            st.toast("Trade Log cleared.", icon="🧹")
+            st.rerun()
+
     if not trades:
         st.info("No trades logged yet. Tick a row's checkbox (left edge of the Monthly / Weekly tables) to log it here instantly.")
         return
