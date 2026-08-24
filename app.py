@@ -65,6 +65,34 @@ st.markdown("""
         div[data-testid="stDataFrame"] {
             font-weight: 600 !important;
         }
+
+        /* Movers panel ("what changed since last refresh") */
+        .movers-panel {
+            border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; margin-bottom: 14px;
+        }
+        .movers-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 8px 14px; background: #f8fafc; border-bottom: 1px solid #e5e7eb;
+            font-size: 12.5px; font-weight: 700; color: #334155;
+        }
+        .movers-empty {
+            padding: 10px 14px; font-size: 13px; color: #94a3b8;
+        }
+        .movers-row {
+            display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+            border-bottom: 1px solid #f1f5f9; font-size: 13px;
+        }
+        .movers-row:last-child { border-bottom: none; }
+        .movers-arrow-up, .movers-arrow-down {
+            width: 22px; height: 22px; border-radius: 6px; display: flex;
+            align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700; font-size: 13px;
+        }
+        .movers-arrow-up { background: #dcfce7; color: #16a34a; }
+        .movers-arrow-down { background: #fee2e2; color: #dc2626; }
+        .movers-sym { font-weight: 700; color: #0f172a; width: 190px; flex-shrink: 0; }
+        .movers-detail { color: #475569; flex: 1; }
+        .movers-delta-up { color: #16a34a; font-weight: 700; }
+        .movers-delta-down { color: #dc2626; font-weight: 700; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -77,6 +105,11 @@ TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
+TRADE_LOG_FILE = os.path.join(DATA_DIR, 'trade_log.json')
+
+# Telegram alerts only start firing from this IST time onward (skips the
+# noisy pre-open / opening-auction minutes).
+ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
 
 # The Monthly / Weekly IV Excel files (produced by the IV Sheet Generator's
 # Monthly and Weekly tabs) replace the old NSE Bhavcopy ZIP as the input
@@ -199,6 +232,45 @@ def save_trigger_alert_state(keys):
         pass
 
 
+# ============================================================
+# TRADE LOG
+#
+# A small persisted list of trades the user has explicitly logged
+# from the scanner (via the "Add to Log" control under each table).
+# Kept separate from the live scan so the scan itself never has to
+# scroll — this is just the handful of positions actually taken.
+# ============================================================
+
+def load_trade_log():
+    if os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def save_trade_log(trades):
+    try:
+        with open(TRADE_LOG_FILE, 'w') as f:
+            json.dump(trades, f)
+    except:
+        pass
+
+def add_trade(trade):
+    trades = load_trade_log()
+    trade = dict(trade)
+    trade['id'] = f"{trade.get('instrument_key')}_{get_ist_now().strftime('%Y%m%d%H%M%S%f')}"
+    trades.append(trade)
+    save_trade_log(trades)
+    return trade['id']
+
+def remove_trade(trade_id):
+    trades = load_trade_log()
+    trades = [t for t in trades if t.get('id') != trade_id]
+    save_trade_log(trades)
+
+
 def send_telegram_alert(bot_token, chat_id, message):
     if not bot_token or not chat_id:
         return False, "Missing bot token or chat ID"
@@ -219,10 +291,15 @@ def send_telegram_alert(bot_token, chat_id, message):
         return False, f"Exception: {e}"
 
 
-def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_id):
+def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_id, threshold_pct=85):
     """
-    Sends a Telegram alert the moment an option's LTP crosses its
-    Trigger price (change % >= 100). Fires once per option per day.
+    Sends a Telegram alert the moment an option's change % (LTP vs Trigger)
+    reaches threshold_pct (default 85, i.e. 85% of the way to Trigger — not
+    only a full 100% cross). Fires once per option per day.
+
+    Alerts are suppressed entirely before ALERT_START_TIME (09:30 IST) so
+    the noisy opening minutes don't spam Telegram; after that time it fires
+    as usual for the rest of the day.
     """
     if not telegram_enabled:
         return
@@ -231,6 +308,10 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
         return
 
     if 'instrument_key' not in df.columns:
+        return
+
+    ist_now = get_ist_now()
+    if ist_now.time() < ALERT_START_TIME:
         return
 
     alerted = load_trigger_alert_state()
@@ -248,14 +329,14 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
         except:
             continue
 
-        if change_pct >= 100 and alert_id not in alerted:
+        if change_pct >= threshold_pct and alert_id not in alerted:
             newly_triggered.append(row)
             alerted.add(alert_id)
 
     if not newly_triggered:
         return
 
-    message_lines = [f"🚀 <b>Trigger Crossed — {key_suffix}</b>"]
+    message_lines = [f"🚀 <b>{threshold_pct:.0f}% Threshold Hit — {key_suffix}</b>"]
     for row in newly_triggered:
         message_lines.append(
             f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
@@ -433,7 +514,236 @@ def fetch_ltp(instrument_keys, token):
     return ltp_map
 
 
-def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, telegram_bot_token="", telegram_chat_id=""):
+# Minimum move (in change % percentage points) for a row to be shown in
+# the "What Changed Since Last Refresh" movers panel — keeps the panel to
+# genuine movers instead of every tiny tick.
+MOVERS_MIN_DELTA = 1.0
+MOVERS_MAX_ROWS = 8
+
+
+def compute_and_render_movers(df, key_suffix):
+    """
+    Compares the current change % for each instrument against the snapshot
+    taken on the previous refresh (stored in st.session_state, so it works
+    whether the "previous refresh" was an auto-refresh fragment rerun or a
+    plain manual rerun). Shows only rows that moved by >= MOVERS_MIN_DELTA
+    percentage points, biggest movers first.
+    """
+    snapshot_key = f'movers_prev_{key_suffix}'
+    snapshot_time_key = f'movers_prev_time_{key_suffix}'
+
+    prev_snapshot = st.session_state.get(snapshot_key, {})
+    prev_time = st.session_state.get(snapshot_time_key)
+
+    current_snapshot = {}
+    movers = []
+
+    for _, row in df.iterrows():
+        inst_key = row.get('instrument_key')
+        if not inst_key or pd.isna(inst_key):
+            continue
+
+        try:
+            cur_change = float(row['change %'])
+        except:
+            continue
+
+        current_snapshot[inst_key] = cur_change
+
+        if inst_key in prev_snapshot:
+            delta = cur_change - prev_snapshot[inst_key]
+            if abs(delta) >= MOVERS_MIN_DELTA:
+                movers.append({
+                    'Symbol': row['Symbol'],
+                    'OptionType': row['OptionType'],
+                    'StrikePrice': row['StrikePrice'],
+                    'Prev': prev_snapshot[inst_key],
+                    'Now': cur_change,
+                    'Delta': delta,
+                })
+
+    # Save this run's snapshot for the *next* refresh to compare against.
+    st.session_state[snapshot_key] = current_snapshot
+    st.session_state[snapshot_time_key] = get_ist_now()
+
+    movers.sort(key=lambda m: abs(m['Delta']), reverse=True)
+    movers = movers[:MOVERS_MAX_ROWS]
+
+    since_label = prev_time.strftime('%H:%M:%S') if prev_time else "—"
+
+    html = ['<div class="movers-panel">']
+    html.append(
+        f'<div class="movers-head"><span>WHAT CHANGED SINCE LAST REFRESH &middot; {since_label} IST</span>'
+        f'<span>{len(movers)} mover(s)</span></div>'
+    )
+
+    if prev_time is None:
+        html.append('<div class="movers-empty">Collecting baseline — movers will show from the next refresh onward.</div>')
+    elif not movers:
+        html.append('<div class="movers-empty">No row moved by more than {:.0f} pts since the last refresh.</div>'.format(MOVERS_MIN_DELTA))
+    else:
+        for m in movers:
+            up = m['Delta'] >= 0
+            arrow_cls = 'movers-arrow-up' if up else 'movers-arrow-down'
+            delta_cls = 'movers-delta-up' if up else 'movers-delta-down'
+            arrow_char = '▲' if up else '▼'
+            html.append(
+                '<div class="movers-row">'
+                f'<div class="{arrow_cls}">{arrow_char}</div>'
+                f'<div class="movers-sym">{m["Symbol"]} {m["StrikePrice"]:.0f} {m["OptionType"]}</div>'
+                f'<div class="movers-detail">Change % moved from {m["Prev"]:.2f}% to {m["Now"]:.2f}%</div>'
+                f'<div class="{delta_cls}">{"+" if up else ""}{m["Delta"]:.2f}%</div>'
+                '</div>'
+            )
+
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def render_add_to_log(data_df, key_suffix, leg_label):
+    """
+    A lightweight picker (select a row + button) that logs the chosen
+    option into the persisted Trade Log, without disturbing the styled
+    dataframe display above it.
+    """
+    # Only rows with a resolved instrument_key can be tracked for live LTP later
+    data_df = data_df[data_df['instrument_key'].notna()]
+    if data_df.empty:
+        return
+
+    options_list = data_df.index.tolist()
+
+    def _fmt(idx):
+        row = data_df.loc[idx]
+        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f}"
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        chosen_idx = st.selectbox(
+            f"Add a {leg_label} row to Trade Log",
+            options=options_list,
+            format_func=_fmt,
+            key=f"{key_suffix}_{leg_label}_add_select",
+            label_visibility="collapsed"
+        )
+    with col_b:
+        if st.button("➕ Add to Log", key=f"{key_suffix}_{leg_label}_add_btn", width='stretch'):
+            row = data_df.loc[chosen_idx]
+            add_trade({
+                'key_suffix': key_suffix,
+                'Symbol': row['Symbol'],
+                'OptionType': row['OptionType'],
+                'StrikePrice': float(row['StrikePrice']),
+                'EntryPrice': float(row['ltp']),
+                'EntryTime': get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Trigger': float(row['Trigger']),
+                'TGT': float(row['TGT']),
+                'SL': float(row['SL']),
+                'instrument_key': row['instrument_key'],
+            })
+            st.toast(f"Added {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} to Trade Log", icon="✅")
+            # Plain st.rerun() from inside a fragment triggers a full-app rerun
+            # (not just this fragment) - needed so the Trade Log tab's own
+            # fragment picks up the new entry immediately instead of waiting
+            # for its next auto-refresh tick.
+            st.rerun()
+
+
+def render_trade_log_tab(access_token):
+    st.header("Trade Log")
+    st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+
+    trades = load_trade_log()
+    if not trades:
+        st.info("No trades logged yet. Use the 'Add to Log' control under the Monthly / Weekly option tables to log a trade here.")
+        return
+
+    trades_df = pd.DataFrame(trades)
+
+    # Live LTP for every logged instrument
+    ltp_cache = load_ltp_cache()
+    inst_keys = trades_df['instrument_key'].dropna().unique().tolist()
+    if access_token and inst_keys:
+        missing = [k for k in inst_keys if k not in ltp_cache]
+        if missing:
+            fetched = fetch_ltp(missing, access_token)
+            if fetched:
+                save_ltp_cache(fetched)
+                ltp_cache = load_ltp_cache()
+
+    trades_df['CurrentLTP'] = trades_df['instrument_key'].map(ltp_cache)
+    trades_df['CurrentLTP'] = trades_df['CurrentLTP'].fillna(trades_df['EntryPrice']).astype(float)
+
+    trades_df['P&L'] = trades_df['CurrentLTP'] - trades_df['EntryPrice']
+    safe_entry = trades_df['EntryPrice'].replace(0, pd.NA)
+    trades_df['P&L %'] = (trades_df['P&L'] / safe_entry) * 100
+    trades_df['P&L %'] = trades_df['P&L %'].fillna(0.0)
+
+    def _status(row):
+        if row['CurrentLTP'] >= row['TGT']:
+            return 'TGT HIT'
+        if row['CurrentLTP'] <= row['SL']:
+            return 'SL HIT'
+        return 'OPEN'
+
+    trades_df['Status'] = trades_df.apply(_status, axis=1)
+
+    display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
+                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status']
+
+    def color_pnl(val):
+        if not isinstance(val, (int, float)):
+            return ''
+        if val > 0:
+            return 'color: #16a34a; font-weight: 700'
+        elif val < 0:
+            return 'color: #dc2626; font-weight: 700'
+        return ''
+
+    def color_status(val):
+        if val == 'TGT HIT':
+            return 'background-color: #bbf7d0; color: #15803d; font-weight: 700'
+        if val == 'SL HIT':
+            return 'background-color: #fecaca; color: #b91c1c; font-weight: 700'
+        return 'background-color: #dbeafe; color: #1d4ed8; font-weight: 700'
+
+    styled = (
+        trades_df[display_cols].style
+        .map(color_pnl, subset=['P&L', 'P&L %'])
+        .map(color_status, subset=['Status'])
+        .format({
+            'StrikePrice': '{:.2f}', 'EntryPrice': '{:.2f}', 'CurrentLTP': '{:.2f}',
+            'P&L': '{:.2f}', 'P&L %': '{:.2f}%'
+        })
+        .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '15px'})
+    )
+
+    st.dataframe(styled, hide_index=True, width='stretch')
+
+    st.markdown("---")
+    st.subheader("Remove a Trade")
+
+    remove_col_a, remove_col_b = st.columns([3, 1])
+    with remove_col_a:
+        remove_choice = st.selectbox(
+            "Select a trade to remove",
+            options=[t['id'] for t in trades],
+            format_func=lambda tid: next(
+                (f"{t['key_suffix']} — {t['Symbol']} {t['StrikePrice']:.0f} {t['OptionType']} (logged {t['EntryTime']})"
+                 for t in trades if t['id'] == tid),
+                tid
+            ),
+            key="remove_trade_select",
+            label_visibility="collapsed"
+        )
+    with remove_col_b:
+        if st.button("🗑️ Remove", key="remove_trade_btn", width='stretch'):
+            remove_trade(remove_choice)
+            st.toast("Trade removed from log.", icon="🗑️")
+            st.rerun()
+
+
+def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info("No data to display. Please upload a valid Monthly IV Excel in the sidebar.")
@@ -491,8 +801,11 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
 
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
 
-    # --- Telegram Trigger Alerts ---
-    check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id)
+    # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
+    check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
+
+    # --- What Changed Since Last Refresh ---
+    compute_and_render_movers(df, key_suffix)
 
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
@@ -542,6 +855,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
             width='stretch',
             height=1800
         )
+        render_add_to_log(calls_df, key_suffix, "CE")
 
     with col2:
         st.subheader("Lower Strike (PE)")
@@ -551,6 +865,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
             width='stretch',
             height=1800
         )
+        render_add_to_log(puts_df, key_suffix, "PE")
 
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
@@ -574,6 +889,7 @@ if is_client_view:
     telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
+    alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT", 85.0))
 
 else:
     with st.sidebar:
@@ -592,8 +908,20 @@ else:
             "Enable Trigger Alerts",
             value=st.session_state.get('telegram_enabled', False),
             key='telegram_enabled',
-            help="Sends a Telegram message the moment an option's LTP crosses its Trigger price (change % >= 100)."
+            help="Sends a Telegram message once an option's change % (LTP vs Trigger) reaches the threshold below. Alerts only start firing from 09:30 AM IST onward."
         )
+
+        alert_threshold_pct = st.number_input(
+            "Alert Threshold (%)",
+            min_value=1.0,
+            max_value=300.0,
+            value=st.session_state.get('alert_threshold_pct', 85.0),
+            step=1.0,
+            key='alert_threshold_pct',
+            help="Telegram alert fires once change % reaches this value (default 85, i.e. before the full 100% Trigger cross)."
+        )
+
+        st.caption("🕤 Alerts are silent before 09:30 AM IST, then active for the rest of the day.")
 
         telegram_bot_token = st.text_input(
             "Bot Token",
@@ -750,7 +1078,7 @@ def get_target_expiry(meta_expiry_key):
     return None
 
 if not nse_json_df.empty:
-    tab_monthly, tab_weekly = st.tabs(["📅 Monthly", "🗓️ Weekly"])
+    tab_monthly, tab_weekly, tab_tradelog = st.tabs(["📅 Monthly", "🗓️ Weekly", "📒 Trade Log"])
 
     with tab_monthly:
         st.header("Monthly Options")
@@ -765,7 +1093,7 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_monthly():
                 df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
-                display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id)
+                display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
             show_monthly()
         else:
             st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
@@ -783,10 +1111,18 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_weekly():
                 df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
-                display_option_chain(df_w, access_token, "Weekly", telegram_enabled, telegram_bot_token, telegram_chat_id)
+                display_option_chain(df_w, access_token, "Weekly", telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
+
+    with tab_tradelog:
+        run_every = refresh_interval if auto_refresh else None
+
+        @st.fragment(run_every=run_every)
+        def show_trade_log():
+            render_trade_log_tab(access_token)
+        show_trade_log()
 
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
