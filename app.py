@@ -600,53 +600,80 @@ def compute_and_render_movers(df, key_suffix):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def render_add_to_log(data_df, key_suffix, leg_label):
+def _extract_selected_rows(select_event):
     """
-    A lightweight picker (select a row + button) that logs the chosen
-    option into the persisted Trade Log, without disturbing the styled
-    dataframe display above it.
+    st.dataframe(..., on_select=...) returns the selection either as an
+    object with a .selection.rows attribute or as a
+    {"selection": {"rows": [...]}} dict, depending on Streamlit version.
+    Normalize both shapes to a plain list of row positions.
     """
-    # Only rows with a resolved instrument_key can be tracked for live LTP later
-    data_df = data_df[data_df['instrument_key'].notna()]
-    if data_df.empty:
+    if select_event is None:
+        return []
+    selection = getattr(select_event, "selection", None)
+    if selection is None and isinstance(select_event, dict):
+        selection = select_event.get("selection")
+    if selection is None:
+        return []
+    rows = getattr(selection, "rows", None)
+    if rows is None and isinstance(selection, dict):
+        rows = selection.get("rows")
+    return list(rows) if rows else []
+
+
+def handle_row_tick_to_log(data_df, key_suffix, leg_label, select_event):
+    """
+    Ticking a row's built-in selection checkbox (left edge of the table -
+    the styled/colored dataframe doesn't support a real checkbox COLUMN,
+    so this uses Streamlit's native row-selection instead) logs that row
+    to the Trade Log immediately, no extra button click needed.
+
+    Guards against re-logging the same option on every rerun (the tick
+    stays "selected" until the user clicks it again) by remembering which
+    instrument_keys have already been logged this browser session.
+    """
+    selected_positions = _extract_selected_rows(select_event)
+    if not selected_positions:
         return
 
-    options_list = data_df.index.tolist()
+    logged_key = f"logged_ids_{key_suffix}_{leg_label}"
+    if logged_key not in st.session_state:
+        st.session_state[logged_key] = set()
+    already_logged = st.session_state[logged_key]
 
-    def _fmt(idx):
-        row = data_df.loc[idx]
-        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f}"
+    newly_logged_labels = []
 
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        chosen_idx = st.selectbox(
-            f"Add a {leg_label} row to Trade Log",
-            options=options_list,
-            format_func=_fmt,
-            key=f"{key_suffix}_{leg_label}_add_select",
-            label_visibility="collapsed"
-        )
-    with col_b:
-        if st.button("➕ Add to Log", key=f"{key_suffix}_{leg_label}_add_btn", width='stretch'):
-            row = data_df.loc[chosen_idx]
-            add_trade({
-                'key_suffix': key_suffix,
-                'Symbol': row['Symbol'],
-                'OptionType': row['OptionType'],
-                'StrikePrice': float(row['StrikePrice']),
-                'EntryPrice': float(row['ltp']),
-                'EntryTime': get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-                'Trigger': float(row['Trigger']),
-                'TGT': float(row['TGT']),
-                'SL': float(row['SL']),
-                'instrument_key': row['instrument_key'],
-            })
-            st.toast(f"Added {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} to Trade Log", icon="✅")
-            # Plain st.rerun() from inside a fragment triggers a full-app rerun
-            # (not just this fragment) - needed so the Trade Log tab's own
-            # fragment picks up the new entry immediately instead of waiting
-            # for its next auto-refresh tick.
-            st.rerun()
+    for pos in selected_positions:
+        if pos < 0 or pos >= len(data_df):
+            continue
+        row = data_df.iloc[pos]
+        inst_key = row.get('instrument_key')
+        if not inst_key or pd.isna(inst_key):
+            continue
+        if inst_key in already_logged:
+            continue
+
+        add_trade({
+            'key_suffix': key_suffix,
+            'Symbol': row['Symbol'],
+            'OptionType': row['OptionType'],
+            'StrikePrice': float(row['StrikePrice']),
+            'EntryPrice': float(row['ltp']),
+            'EntryTime': get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
+            'Trigger': float(row['Trigger']),
+            'TGT': float(row['TGT']),
+            'SL': float(row['SL']),
+            'instrument_key': inst_key,
+        })
+        already_logged.add(inst_key)
+        newly_logged_labels.append(f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}")
+
+    if newly_logged_labels:
+        st.toast(f"Logged to Trade Log: {', '.join(newly_logged_labels)}", icon="✅")
+        # Plain st.rerun() from inside a fragment triggers a full-app rerun
+        # (not just this fragment) - needed so the Trade Log tab's own
+        # fragment picks up the new entry immediately instead of waiting
+        # for its next auto-refresh tick.
+        st.rerun()
 
 
 def render_trade_log_tab(access_token):
@@ -655,7 +682,7 @@ def render_trade_log_tab(access_token):
 
     trades = load_trade_log()
     if not trades:
-        st.info("No trades logged yet. Use the 'Add to Log' control under the Monthly / Weekly option tables to log a trade here.")
+        st.info("No trades logged yet. Tick a row's checkbox (left edge of the Monthly / Weekly tables) to log it here instantly.")
         return
 
     trades_df = pd.DataFrame(trades)
@@ -849,23 +876,31 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
-        st.dataframe(
+        st.caption("☑️ Tick a row on the left to send it straight to the Trade Log")
+        calls_event = st.dataframe(
             render_table(calls_df),
             hide_index=True,
             width='stretch',
-            height=1800
+            height=1800,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key=f"{key_suffix}_ce_select"
         )
-        render_add_to_log(calls_df, key_suffix, "CE")
+        handle_row_tick_to_log(calls_df, key_suffix, "CE", calls_event)
 
     with col2:
         st.subheader("Lower Strike (PE)")
-        st.dataframe(
+        st.caption("☑️ Tick a row on the left to send it straight to the Trade Log")
+        puts_event = st.dataframe(
             render_table(puts_df),
             hide_index=True,
             width='stretch',
-            height=1800
+            height=1800,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key=f"{key_suffix}_pe_select"
         )
-        render_add_to_log(puts_df, key_suffix, "PE")
+        handle_row_tick_to_log(puts_df, key_suffix, "PE", puts_event)
 
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
