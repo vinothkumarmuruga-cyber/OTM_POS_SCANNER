@@ -116,6 +116,7 @@ TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
+TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
 TRADE_LOG_FILE = os.path.join(DATA_DIR, 'trade_log.json')
 
 # Telegram alerts only start firing from this IST time onward (skips the
@@ -244,6 +245,38 @@ def save_trigger_alert_state(keys):
 
 
 # ============================================================
+# TRIGGERED-ON TIMESTAMPS (Monthly/Weekly CE/PE tables)
+#
+# Records the first moment each option's change % actually reaches 100%
+# (LTP reaching the Trigger price itself) so the table can show WHEN it
+# triggered, not just that it currently reads high. Date-scoped like the
+# alert state above, so it resets fresh each trading day.
+# ============================================================
+
+def load_trigger_time_state():
+    if os.path.exists(TRIGGER_TIME_FILE):
+        try:
+            with open(TRIGGER_TIME_FILE, 'r') as f:
+                data = json.load(f)
+                if data.get('date') == get_ist_now().strftime('%Y-%m-%d'):
+                    return data.get('times', {})
+        except:
+            pass
+    return {}
+
+def save_trigger_time_state(times):
+    try:
+        data = {
+            'date': get_ist_now().strftime('%Y-%m-%d'),
+            'times': times
+        }
+        with open(TRIGGER_TIME_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
+
+
+# ============================================================
 # TRADE LOG
 #
 # A small persisted list of trades the user has explicitly logged
@@ -308,9 +341,12 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     reaches threshold_pct (default 85, i.e. 85% of the way to Trigger — not
     only a full 100% cross). Fires once per option per day.
 
-    Alerts are suppressed entirely before ALERT_START_TIME (09:30 IST) so
-    the noisy opening minutes don't spam Telegram; after that time it fires
-    as usual for the rest of the day.
+    Alerts are suppressed before ALERT_START_TIME (09:30 IST) so the noisy
+    opening minutes don't spam Telegram — but crucially, anything already
+    at/above threshold_pct *before* 09:30 is silently marked as "seen"
+    (never actually messaged) so it doesn't get dumped as a fake "just
+    crossed" alert the instant the clock ticks past 09:30. Only strikes
+    that genuinely cross the threshold AFTER 09:30 ever produce a message.
     """
     if not telegram_enabled:
         return
@@ -322,10 +358,28 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
         return
 
     ist_now = get_ist_now()
+    alerted = load_trigger_alert_state()
+
     if ist_now.time() < ALERT_START_TIME:
+        # Pre-market / opening-auction window: silently record anything
+        # already at/above threshold so it's excluded once alerting turns
+        # on at 09:30, instead of firing in a batch right at that moment.
+        pre_seen = set()
+        for _, row in df.iterrows():
+            inst_key = row.get('instrument_key')
+            if not inst_key or pd.isna(inst_key):
+                continue
+            try:
+                change_pct = float(row.get('change %', 0.0))
+            except:
+                continue
+            if change_pct >= threshold_pct:
+                pre_seen.add(f"{key_suffix}:{inst_key}")
+
+        if pre_seen - alerted:
+            save_trigger_alert_state(alerted | pre_seen)
         return
 
-    alerted = load_trigger_alert_state()
     newly_triggered = []
 
     for _, row in df.iterrows():
@@ -347,7 +401,11 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     if not newly_triggered:
         return
 
-    message_lines = [f"🚀 <b>{threshold_pct:.0f}% Threshold Hit — {key_suffix}</b>"]
+    trigger_time_label = ist_now.strftime('%d-%b-%Y %H:%M:%S')
+    message_lines = [
+        f"🚀 <b>{threshold_pct:.0f}% Threshold Hit — {key_suffix}</b>",
+        f"🕐 Triggered: {trigger_time_label} IST"
+    ]
     for row in newly_triggered:
         message_lines.append(
             f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
@@ -523,6 +581,65 @@ def fetch_ltp(instrument_keys, token):
                 pass
 
     return ltp_map
+
+
+# An option counts as "triggered" once its change % (LTP vs Trigger) first
+# reaches this — i.e. LTP has actually reached the Trigger price itself.
+TRIGGERED_AT_PCT = 100.0
+
+
+def attach_trigger_times(df, key_suffix):
+    """
+    Stamps a 'Triggered On' column onto df: the date & time the option's
+    change % FIRST reached TRIGGERED_AT_PCT (100%, i.e. LTP actually hit
+    the Trigger price). Once recorded it never changes for the rest of the
+    day, even if price dips back below — so it always shows the moment it
+    first triggered, not "is currently above". Persisted to disk so it
+    survives refreshes/reruns. Blank ('—') until that happens.
+
+    Format: "<day-of-month>&<hour>.<minute>" in 12-hour clock, e.g. a
+    trigger at 13:35 IST on the 24th shows as "24&1.35".
+    """
+    times = load_trigger_time_state()
+    changed = False
+
+    now_dt = get_ist_now()
+    hour_12 = now_dt.hour % 12
+    if hour_12 == 0:
+        hour_12 = 12
+    now_label = f"{now_dt.day}&{hour_12}.{now_dt.minute:02d}"
+
+    labels = []
+    for _, row in df.iterrows():
+        inst_key = row.get('instrument_key')
+        if not inst_key or pd.isna(inst_key):
+            labels.append('—')
+            continue
+
+        key = f"{key_suffix}:{inst_key}"
+
+        if key in times:
+            labels.append(times[key])
+            continue
+
+        try:
+            change_pct = float(row.get('change %', 0.0))
+        except:
+            change_pct = 0.0
+
+        if change_pct >= TRIGGERED_AT_PCT:
+            times[key] = now_label
+            changed = True
+            labels.append(now_label)
+        else:
+            labels.append('—')
+
+    if changed:
+        save_trigger_time_state(times)
+
+    df = df.copy()
+    df['Triggered On'] = labels
+    return df
 
 
 # Minimum move (in change % percentage points) for a row to be shown in
@@ -805,8 +922,18 @@ def render_trade_log_tab(access_token):
 
     trades_df['Status'] = trades_df.apply(_status_label, axis=1)
 
+    # When TGT/SL actually froze the trade — so a "TGT HIT"/"SL HIT" row
+    # never leaves you guessing whether that happened today or was left
+    # over from an earlier day the log wasn't cleared.
+    def _triggered_on(row):
+        if row.get('frozen'):
+            return row.get('frozen_time') or '—'
+        return '—'
+
+    trades_df['Triggered On'] = trades_df.apply(_triggered_on, axis=1)
+
     display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
-                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status']
+                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status', 'Triggered On']
 
     def color_pnl(val):
         if not isinstance(val, (int, float)):
@@ -932,6 +1059,9 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     # --- What Changed Since Last Refresh ---
     compute_and_render_movers(df, key_suffix)
 
+    # --- Triggered On (first time change % reached 100%, i.e. LTP hit Trigger) ---
+    df = attach_trigger_times(df, key_suffix)
+
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
     puts_df = df[df['OptionType'] == 'PE'].copy()
@@ -939,7 +1069,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
-    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL']
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
 
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
