@@ -316,6 +316,15 @@ def remove_trade(trade_id):
     save_trade_log(trades)
 
 
+@st.cache_resource
+def _get_telegram_session():
+    # A reused, persistent connection (kept alive across fragment reruns via
+    # st.cache_resource) instead of opening a fresh TCP+TLS handshake to
+    # Telegram on every single alert - shaves a meaningful chunk off how
+    # long "Send Test" / a live alert takes to actually go out.
+    return requests.Session()
+
+
 def send_telegram_alert(bot_token, chat_id, message):
     if not bot_token or not chat_id:
         return False, "Missing bot token or chat ID"
@@ -328,7 +337,7 @@ def send_telegram_alert(bot_token, chat_id, message):
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = _get_telegram_session().post(url, json=payload, timeout=10)
         if response.status_code == 200:
             return True, None
         return False, f"HTTP {response.status_code}: {response.text[:200]}"
@@ -403,19 +412,12 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
         return
 
     trigger_time_label = ist_now.strftime('%d-%b-%Y %H:%M:%S')
-    message_lines = [
-        f"🚀 <b>{threshold_pct:.0f}% Threshold Hit — {key_suffix}</b>",
-        f"🕐 Triggered: {trigger_time_label} IST"
+    header = f"🚀 <b>{threshold_pct:.0f}% Hit — {key_suffix}</b> · {trigger_time_label} IST"
+    option_lines = [
+        f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} | LTP {row['ltp']:.2f} | Trig {row['Trigger']:.2f}"
+        for row in newly_triggered
     ]
-    for row in newly_triggered:
-        message_lines.append(
-            f"\n<b>{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}</b>\n"
-            f"LTP: {row['ltp']:.2f}  ›  Trigger: {row['Trigger']:.2f}\n"
-            f"TGT: {row['TGT']:.2f}  ›  SL: {row['SL']:.2f}\n"
-            f"Change: {row['change %']:.2f}%"
-        )
-
-    message = "\n".join(message_lines)
+    message = header + "\n" + "\n".join(option_lines)
     success, error = send_telegram_alert(bot_token, chat_id, message)
 
     if success:
