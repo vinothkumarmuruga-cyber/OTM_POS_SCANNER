@@ -249,27 +249,28 @@ def save_trigger_alert_state(keys):
 #
 # Records the first moment each option's change % actually reaches 100%
 # (LTP reaching the Trigger price itself) so the table can show WHEN it
-# triggered, not just that it currently reads high. Date-scoped like the
-# alert state above, so it resets fresh each trading day.
+# triggered, not just that it currently reads high.
+#
+# NOT date-scoped (unlike the Telegram alert-dedup state above) - this is
+# keyed by key_suffix + expiry date + instrument, so a "Triggered On"
+# stamp holds steady across every refresh AND every day for the entire
+# Monthly / Weekly expiry cycle. It only goes away once you upload a new
+# IV Excel with a different expiry for that section (the old expiry's keys
+# simply stop being looked up).
 # ============================================================
 
 def load_trigger_time_state():
     if os.path.exists(TRIGGER_TIME_FILE):
         try:
             with open(TRIGGER_TIME_FILE, 'r') as f:
-                data = json.load(f)
-                if data.get('date') == get_ist_now().strftime('%Y-%m-%d'):
-                    return data.get('times', {})
+                return json.load(f)
         except:
             pass
     return {}
 
 def save_trigger_time_state(times):
     try:
-        data = {
-            'date': get_ist_now().strftime('%Y-%m-%d'),
-            'times': times
-        }
+        data = times
         with open(TRIGGER_TIME_FILE, 'w') as f:
             json.dump(data, f)
     except:
@@ -588,17 +589,21 @@ def fetch_ltp(instrument_keys, token):
 TRIGGERED_AT_PCT = 100.0
 
 
-def attach_trigger_times(df, key_suffix):
+def attach_trigger_times(df, key_suffix, expiry_date):
     """
     Stamps a 'Triggered On' column onto df: the date & time the option's
     change % FIRST reached TRIGGERED_AT_PCT (100%, i.e. LTP actually hit
-    the Trigger price). Once recorded it never changes for the rest of the
-    day, even if price dips back below — so it always shows the moment it
-    first triggered, not "is currently above". Persisted to disk so it
-    survives refreshes/reruns. Blank ('—') until that happens.
+    the Trigger price). Once recorded it NEVER changes again — not for the
+    rest of the day, and not on later days either — for as long as this
+    Monthly/Weekly section keeps the same expiry_date. It only resets once
+    you upload a new IV Excel with a different expiry (a new expiry_date
+    means a brand-new set of keys, so the old stamps simply stop applying).
+    Persisted to disk so it survives refreshes/reruns. Blank ('—') until
+    the option actually triggers.
 
     Format: "<day-of-month>&<hour>.<minute>" in 12-hour clock, e.g. a
-    trigger at 13:35 IST on the 24th shows as "24&1.35".
+    trigger at 13:35 IST on the 24th shows as "24&1.35" (the day/time it
+    FIRST happened, not today's date).
     """
     times = load_trigger_time_state()
     changed = False
@@ -609,6 +614,8 @@ def attach_trigger_times(df, key_suffix):
         hour_12 = 12
     now_label = f"{now_dt.day}&{hour_12}.{now_dt.minute:02d}"
 
+    expiry_key = expiry_date.strftime('%Y-%m-%d') if expiry_date is not None else 'noexpiry'
+
     labels = []
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
@@ -616,7 +623,7 @@ def attach_trigger_times(df, key_suffix):
             labels.append('—')
             continue
 
-        key = f"{key_suffix}:{inst_key}"
+        key = f"{key_suffix}:{expiry_key}:{inst_key}"
 
         if key in times:
             labels.append(times[key])
@@ -987,7 +994,7 @@ def render_trade_log_tab(access_token):
             st.rerun()
 
 
-def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
+def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info("No data to display. Please upload a valid Monthly IV Excel in the sidebar.")
@@ -1060,7 +1067,7 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     compute_and_render_movers(df, key_suffix)
 
     # --- Triggered On (first time change % reached 100%, i.e. LTP hit Trigger) ---
-    df = attach_trigger_times(df, key_suffix)
+    df = attach_trigger_times(df, key_suffix, expiry_date)
 
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
@@ -1348,7 +1355,7 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_monthly():
                 df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
-                display_option_chain(df_m, access_token, "Monthly", telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
+                display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=telegram_enabled, telegram_bot_token=telegram_bot_token, telegram_chat_id=telegram_chat_id, alert_threshold_pct=alert_threshold_pct)
             show_monthly()
         else:
             st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
@@ -1366,7 +1373,7 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_weekly():
                 df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
-                display_option_chain(df_w, access_token, "Weekly", telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
+                display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=telegram_enabled, telegram_bot_token=telegram_bot_token, telegram_chat_id=telegram_chat_id, alert_threshold_pct=alert_threshold_pct)
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
