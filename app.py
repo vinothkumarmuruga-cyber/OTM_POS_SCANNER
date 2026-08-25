@@ -276,6 +276,19 @@ def save_trigger_time_state(times):
     except:
         pass
 
+def clear_trigger_times_for_section(key_suffix):
+    """
+    Wipes every 'Triggered On' stamp recorded for this section (Monthly or
+    Weekly), regardless of expiry. Called the moment a genuinely new IV
+    Excel is uploaded for that section, so there's never any ambiguity
+    about whether a stamp you're looking at is a fresh same-day trigger or
+    a stale leftover from before - a new upload always starts clean.
+    """
+    times = load_trigger_time_state()
+    remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
+    if len(remaining) != len(times):
+        save_trigger_time_state(remaining)
+
 
 # ============================================================
 # TRADE LOG
@@ -1254,12 +1267,15 @@ else:
 
         st.markdown("---")
 
-        def render_iv_upload_section(section_key, file_path, meta_file_key, meta_expiry_key, label, example_name):
+        def render_iv_upload_section(section_key, file_path, meta_file_key, meta_expiry_key, label, example_name, trigger_key_suffix):
             """
             Renders one Upload + Confirm Expiry block (used for both the
             Monthly IV Excel and the Weekly IV Excel sections below).
             section_key keeps each block's widget keys independent so the
-            two sections never clash with each other.
+            two sections never clash with each other. trigger_key_suffix is
+            the "Monthly"/"Weekly" namespace used by attach_trigger_times,
+            so a fresh upload here can wipe that section's Triggered On
+            history.
             """
             st.subheader(label)
             up_iv = st.file_uploader(
@@ -1287,6 +1303,11 @@ else:
                     with open(file_path, "wb") as f:
                         f.write(up_iv.getvalue())
                     save_meta(meta_file_key, up_iv.name)
+
+                    # A genuinely new file for this section always starts
+                    # Triggered On fresh - no ambiguity about whether a
+                    # stamp is a real same-day trigger or a stale leftover.
+                    clear_trigger_times_for_section(trigger_key_suffix)
 
                     detected_expiry = extract_expiry_from_filename(up_iv.name)
                     if detected_expiry is not None:
@@ -1330,7 +1351,8 @@ else:
             meta_file_key='MonthlyIVFileName',
             meta_expiry_key='MonthlyIVExpiry',
             label='Monthly IV Excel',
-            example_name='Monthly IV 25AUG2026.xlsx'
+            example_name='Monthly IV 25AUG2026.xlsx',
+            trigger_key_suffix='Monthly'
         )
 
         st.markdown("---")
@@ -1342,7 +1364,8 @@ else:
             meta_file_key='WeeklyIVFileName',
             meta_expiry_key='WeeklyIVExpiry',
             label='Weekly IV Excel',
-            example_name='Weekly IV 29AUG2026.xlsx'
+            example_name='Weekly IV 29AUG2026.xlsx',
+            trigger_key_suffix='Weekly'
         )
 
         st.markdown("---")
