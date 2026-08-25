@@ -1276,6 +1276,13 @@ else:
                 detected_expiry = extract_expiry_from_filename(up_iv.name)
                 if detected_expiry is not None:
                     save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
+                    # The "Confirm Expiry Date" widget below has a persistent
+                    # key, so Streamlit would otherwise keep showing whatever
+                    # date was last picked for the PREVIOUS file and silently
+                    # save that stale date straight back over the one we just
+                    # detected. Clearing its session state forces it to
+                    # re-initialize from the freshly saved meta value instead.
+                    st.session_state.pop(f'{section_key}_expiry_input', None)
                     st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
                 else:
                     st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
