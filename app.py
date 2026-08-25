@@ -687,14 +687,13 @@ def render_add_to_log_selector(data_df, key_suffix, leg_label):
 
 def _update_trade_freeze_state(trade, current_ltp):
     """
-    Confirms a TGT/SL hit only once it holds for 2 consecutive checks in a
-    row — a single touch of the level is treated as noise ("not valid") and
-    is ignored. Once confirmed, the trade is frozen: its LTP/P&L lock at
-    the confirming price permanently and it is never re-evaluated again,
-    even if price later moves back across TGT/SL.
+    The moment an option's LTP first touches TGT or SL, the trade freezes
+    permanently for the rest of the day: Status/CurrentLTP/P&L lock at that
+    price right then and are never recalculated again, no matter what price
+    does afterwards. A trade that is already frozen is a no-op here — later
+    hits don't matter, the first one is final.
 
-    Mutates `trade` in place (adds/updates 'pending_hit',
-    'pending_hit_count', 'frozen', 'frozen_status', 'frozen_ltp',
+    Mutates `trade` in place (sets 'frozen', 'frozen_status', 'frozen_ltp',
     'frozen_time'). Returns True if `trade` was changed (so the caller
     knows to persist it back to disk).
     """
@@ -707,36 +706,18 @@ def _update_trade_freeze_state(trade, current_ltp):
     except (TypeError, ValueError):
         return False
 
-    raw_hit = None
     if current_ltp >= tgt:
-        raw_hit = 'TGT'
+        hit_status = 'TGT HIT'
     elif current_ltp <= sl:
-        raw_hit = 'SL'
-
-    prev_pending = trade.get('pending_hit')
-    prev_count = trade.get('pending_hit_count', 0)
-
-    if raw_hit is None:
-        if prev_pending is not None or prev_count:
-            trade['pending_hit'] = None
-            trade['pending_hit_count'] = 0
-            return True
+        hit_status = 'SL HIT'
+    else:
         return False
 
-    new_count = prev_count + 1 if raw_hit == prev_pending else 1
-    changed = (raw_hit != prev_pending) or (new_count != prev_count)
-
-    trade['pending_hit'] = raw_hit
-    trade['pending_hit_count'] = new_count
-
-    if new_count >= 2:
-        trade['frozen'] = True
-        trade['frozen_status'] = 'TGT HIT' if raw_hit == 'TGT' else 'SL HIT'
-        trade['frozen_ltp'] = current_ltp
-        trade['frozen_time'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
-        changed = True
-
-    return changed
+    trade['frozen'] = True
+    trade['frozen_status'] = hit_status
+    trade['frozen_ltp'] = current_ltp
+    trade['frozen_time'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
+    return True
 
 
 def render_trade_log_tab(access_token):
@@ -758,7 +739,19 @@ def render_trade_log_tab(access_token):
         st.info("No trades logged yet. Use the 'Add to Trade Log' picker above the Monthly / Weekly CE/PE tables to log one here.")
         return
 
-    st.caption("🔒 A TGT/SL hit freezes the trade (LTP/P&L locked) only after it holds for 2 consecutive refreshes — a single touch is ignored as noise.")
+    st.caption("🔒 The moment TGT or SL is hit, that trade's Status/LTP/P&L freeze for the rest of the day and never change again.")
+
+    # Normalize legacy/partial trade dicts so every row has the same set of
+    # freeze-related keys with real values (False/None), never a missing
+    # key. This matters because pandas fills a missing dict key with NaN
+    # when building the DataFrame below, and NaN is TRUTHY in Python -
+    # "if row.get('frozen'):" was treating un-frozen rows as frozen too,
+    # which is why CurrentLTP/P&L/Status were showing up blank as "None".
+    for t in trades:
+        t.setdefault('frozen', False)
+        t.setdefault('frozen_status', None)
+        t.setdefault('frozen_ltp', None)
+        t.setdefault('frozen_time', None)
 
     # Live LTP for every logged instrument
     ltp_cache = load_ltp_cache()
@@ -782,7 +775,7 @@ def render_trade_log_tab(access_token):
             pass
         return float(entry_price)
 
-    # --- TGT/SL hit confirmation + freeze (2 consecutive hits required) ---
+    # --- TGT/SL hit freeze (freezes instantly on the first hit) ---
     any_changed = False
     for t in trades:
         live_ltp = _live_ltp(t.get('instrument_key'), t.get('EntryPrice'))
