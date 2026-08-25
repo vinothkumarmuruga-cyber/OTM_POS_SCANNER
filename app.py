@@ -1269,23 +1269,40 @@ else:
                 help=f"The output file from the IV Sheet Generator (e.g. '{example_name}')."
             )
             if up_iv is not None:
-                with open(file_path, "wb") as f:
-                    f.write(up_iv.getvalue())
-                save_meta(meta_file_key, up_iv.name)
+                # st.file_uploader keeps returning the SAME UploadedFile on
+                # every single rerun for as long as it sits in the widget -
+                # not just on the rerun where it was chosen. Several actions
+                # elsewhere in this app (adding/removing a trade, clearing
+                # the log, etc.) trigger a full-page st.rerun(), and without
+                # this guard every one of those reruns would re-detect the
+                # expiry from the SAME original filename and stomp any
+                # manual correction made afterwards in "Confirm Expiry
+                # Date". file_id (or name+size as a fallback) uniquely
+                # identifies one upload event, so this block now only runs
+                # once per GENUINE new upload.
+                upload_marker = getattr(up_iv, 'file_id', None) or f"{up_iv.name}:{up_iv.size}"
+                processed_key = f'{section_key}_last_processed_upload'
 
-                detected_expiry = extract_expiry_from_filename(up_iv.name)
-                if detected_expiry is not None:
-                    save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
-                    # The "Confirm Expiry Date" widget below has a persistent
-                    # key, so Streamlit would otherwise keep showing whatever
-                    # date was last picked for the PREVIOUS file and silently
-                    # save that stale date straight back over the one we just
-                    # detected. Clearing its session state forces it to
-                    # re-initialize from the freshly saved meta value instead.
-                    st.session_state.pop(f'{section_key}_expiry_input', None)
-                    st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
-                else:
-                    st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
+                if st.session_state.get(processed_key) != upload_marker:
+                    with open(file_path, "wb") as f:
+                        f.write(up_iv.getvalue())
+                    save_meta(meta_file_key, up_iv.name)
+
+                    detected_expiry = extract_expiry_from_filename(up_iv.name)
+                    if detected_expiry is not None:
+                        save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
+                        # The "Confirm Expiry Date" widget below has a
+                        # persistent key, so Streamlit would otherwise keep
+                        # showing whatever date was last picked for the
+                        # PREVIOUS file. Clearing its session state forces
+                        # it to re-initialize from the freshly saved meta
+                        # value instead.
+                        st.session_state.pop(f'{section_key}_expiry_input', None)
+                        st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
+                    else:
+                        st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
+
+                    st.session_state[processed_key] = upload_marker
 
             meta = load_meta()
 
