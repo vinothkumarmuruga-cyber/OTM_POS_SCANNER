@@ -89,10 +89,21 @@ st.markdown("""
         }
         .movers-arrow-up { background: #dcfce7; color: #16a34a; }
         .movers-arrow-down { background: #fee2e2; color: #dc2626; }
-        .movers-sym { font-weight: 700; color: #0f172a; width: 190px; flex-shrink: 0; }
+        .movers-sym { font-weight: 700; color: #0f172a; width: 150px; flex-shrink: 0; }
         .movers-detail { color: #475569; flex: 1; }
         .movers-delta-up { color: #16a34a; font-weight: 700; }
         .movers-delta-down { color: #dc2626; font-weight: 700; }
+
+        /* Movers panel split into CE / PE columns */
+        .movers-body { display: flex; }
+        .movers-side { flex: 1; min-width: 0; }
+        .movers-side:first-child { border-right: 1px solid #e5e7eb; }
+        .movers-side-head {
+            padding: 6px 14px; font-size: 11px; font-weight: 700; color: #64748b;
+            background: #fafbfc; border-bottom: 1px solid #f1f5f9; letter-spacing: 0.03em;
+        }
+        .movers-side .movers-row { padding: 8px 10px; }
+        .movers-side .movers-sym { width: auto; margin-right: 4px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -520,14 +531,22 @@ def fetch_ltp(instrument_keys, token):
 MOVERS_MIN_DELTA = 1.0
 MOVERS_MAX_ROWS = 8
 
+# Movers panel only shows options whose CURRENT change % (LTP vs Trigger)
+# is within this band — too far below 75% isn't worth watching yet, and
+# above 125% is already well past Trigger.
+MOVERS_MIN_PCT = 75.0
+MOVERS_MAX_PCT = 125.0
+
 
 def compute_and_render_movers(df, key_suffix):
     """
     Compares the current change % for each instrument against the snapshot
     taken on the previous refresh (stored in st.session_state, so it works
     whether the "previous refresh" was an auto-refresh fragment rerun or a
-    plain manual rerun). Shows only rows that moved by >= MOVERS_MIN_DELTA
-    percentage points, biggest movers first.
+    plain manual rerun). Only shows rows that moved UP by >= MOVERS_MIN_DELTA
+    percentage points AND whose current change % is between MOVERS_MIN_PCT
+    and MOVERS_MAX_PCT, split into separate CE / PE columns, biggest movers
+    first.
     """
     snapshot_key = f'movers_prev_{key_suffix}'
     snapshot_time_key = f'movers_prev_time_{key_suffix}'
@@ -536,7 +555,8 @@ def compute_and_render_movers(df, key_suffix):
     prev_time = st.session_state.get(snapshot_time_key)
 
     current_snapshot = {}
-    movers = []
+    ce_movers = []
+    pe_movers = []
 
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
@@ -552,105 +572,98 @@ def compute_and_render_movers(df, key_suffix):
 
         if inst_key in prev_snapshot:
             delta = cur_change - prev_snapshot[inst_key]
-            if abs(delta) >= MOVERS_MIN_DELTA:
-                movers.append({
+            # Only positive (upward) moves, and only within the 75%-125% band.
+            if delta >= MOVERS_MIN_DELTA and MOVERS_MIN_PCT <= cur_change <= MOVERS_MAX_PCT:
+                mover = {
                     'Symbol': row['Symbol'],
-                    'OptionType': row['OptionType'],
                     'StrikePrice': row['StrikePrice'],
                     'Prev': prev_snapshot[inst_key],
                     'Now': cur_change,
                     'Delta': delta,
-                })
+                }
+                if row['OptionType'] == 'CE':
+                    ce_movers.append(mover)
+                else:
+                    pe_movers.append(mover)
 
     # Save this run's snapshot for the *next* refresh to compare against.
     st.session_state[snapshot_key] = current_snapshot
     st.session_state[snapshot_time_key] = get_ist_now()
 
-    movers.sort(key=lambda m: abs(m['Delta']), reverse=True)
-    movers = movers[:MOVERS_MAX_ROWS]
+    ce_movers.sort(key=lambda m: m['Delta'], reverse=True)
+    pe_movers.sort(key=lambda m: m['Delta'], reverse=True)
+    ce_movers = ce_movers[:MOVERS_MAX_ROWS]
+    pe_movers = pe_movers[:MOVERS_MAX_ROWS]
 
     since_label = prev_time.strftime('%H:%M:%S') if prev_time else "—"
+
+    def render_side(movers, label):
+        side_html = [f'<div class="movers-side"><div class="movers-side-head">{label} &middot; {len(movers)} mover(s)</div>']
+        if prev_time is None:
+            side_html.append('<div class="movers-empty">Collecting baseline…</div>')
+        elif not movers:
+            side_html.append('<div class="movers-empty">No qualifying mover (75%-125% band).</div>')
+        else:
+            for m in movers:
+                side_html.append(
+                    '<div class="movers-row">'
+                    '<div class="movers-arrow-up">▲</div>'
+                    f'<div class="movers-sym">{m["Symbol"]} {m["StrikePrice"]:.0f}</div>'
+                    f'<div class="movers-detail">{m["Prev"]:.2f}% &rarr; {m["Now"]:.2f}%</div>'
+                    f'<div class="movers-delta-up">+{m["Delta"]:.2f}%</div>'
+                    '</div>'
+                )
+        side_html.append('</div>')
+        return "".join(side_html)
 
     html = ['<div class="movers-panel">']
     html.append(
         f'<div class="movers-head"><span>WHAT CHANGED SINCE LAST REFRESH &middot; {since_label} IST</span>'
-        f'<span>{len(movers)} mover(s)</span></div>'
+        f'<span>{len(ce_movers)} CE &middot; {len(pe_movers)} PE</span></div>'
     )
-
-    if prev_time is None:
-        html.append('<div class="movers-empty">Collecting baseline — movers will show from the next refresh onward.</div>')
-    elif not movers:
-        html.append('<div class="movers-empty">No row moved by more than {:.0f} pts since the last refresh.</div>'.format(MOVERS_MIN_DELTA))
-    else:
-        for m in movers:
-            up = m['Delta'] >= 0
-            arrow_cls = 'movers-arrow-up' if up else 'movers-arrow-down'
-            delta_cls = 'movers-delta-up' if up else 'movers-delta-down'
-            arrow_char = '▲' if up else '▼'
-            html.append(
-                '<div class="movers-row">'
-                f'<div class="{arrow_cls}">{arrow_char}</div>'
-                f'<div class="movers-sym">{m["Symbol"]} {m["StrikePrice"]:.0f} {m["OptionType"]}</div>'
-                f'<div class="movers-detail">Change % moved from {m["Prev"]:.2f}% to {m["Now"]:.2f}%</div>'
-                f'<div class="{delta_cls}">{"+" if up else ""}{m["Delta"]:.2f}%</div>'
-                '</div>'
-            )
-
+    html.append('<div class="movers-body">')
+    html.append(render_side(ce_movers, "CE"))
+    html.append(render_side(pe_movers, "PE"))
+    html.append('</div>')
     html.append('</div>')
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def _extract_selected_rows(select_event):
+def render_add_to_log_selector(data_df, key_suffix, leg_label):
     """
-    st.dataframe(..., on_select=...) returns the selection either as an
-    object with a .selection.rows attribute or as a
-    {"selection": {"rows": [...]}} dict, depending on Streamlit version.
-    Normalize both shapes to a plain list of row positions.
+    A stock-picker (selectbox) + "Add" button placed ABOVE the CE/PE table,
+    used to log an option to the Trade Log. Replaces the old row-tick /
+    checkbox selection, which was easy to mis-click while the table keeps
+    auto-refreshing under the user's cursor.
     """
-    if select_event is None:
-        return []
-    selection = getattr(select_event, "selection", None)
-    if selection is None and isinstance(select_event, dict):
-        selection = select_event.get("selection")
-    if selection is None:
-        return []
-    rows = getattr(selection, "rows", None)
-    if rows is None and isinstance(selection, dict):
-        rows = selection.get("rows")
-    return list(rows) if rows else []
-
-
-def handle_row_tick_to_log(data_df, key_suffix, leg_label, select_event):
-    """
-    Ticking a row's built-in selection checkbox (left edge of the table -
-    the styled/colored dataframe doesn't support a real checkbox COLUMN,
-    so this uses Streamlit's native row-selection instead) logs that row
-    to the Trade Log immediately, no extra button click needed.
-
-    Guards against re-logging the same option on every rerun (the tick
-    stays "selected" until the user clicks it again) by remembering which
-    instrument_keys have already been logged this browser session.
-    """
-    selected_positions = _extract_selected_rows(select_event)
-    if not selected_positions:
+    if data_df.empty:
+        st.caption("No rows available.")
         return
 
-    logged_key = f"logged_ids_{key_suffix}_{leg_label}"
-    if logged_key not in st.session_state:
-        st.session_state[logged_key] = set()
-    already_logged = st.session_state[logged_key]
+    options = list(data_df.index)
 
-    newly_logged_labels = []
+    def _fmt(idx):
+        row = data_df.loc[idx]
+        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
 
-    for pos in selected_positions:
-        if pos < 0 or pos >= len(data_df):
-            continue
-        row = data_df.iloc[pos]
+    sel_col, btn_col = st.columns([4, 1])
+    with sel_col:
+        chosen_idx = st.selectbox(
+            "Add to Trade Log",
+            options=options,
+            format_func=_fmt,
+            key=f"{key_suffix}_{leg_label}_add_select",
+            label_visibility="collapsed"
+        )
+    with btn_col:
+        add_clicked = st.button("➕ Add to Log", key=f"{key_suffix}_{leg_label}_add_btn", width='stretch')
+
+    if add_clicked and chosen_idx is not None:
+        row = data_df.loc[chosen_idx]
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
-            continue
-        if inst_key in already_logged:
-            continue
+            st.toast("Cannot log — missing instrument key.", icon="⚠️")
+            return
 
         add_trade({
             'key_suffix': key_suffix,
@@ -664,11 +677,7 @@ def handle_row_tick_to_log(data_df, key_suffix, leg_label, select_event):
             'SL': float(row['SL']),
             'instrument_key': inst_key,
         })
-        already_logged.add(inst_key)
-        newly_logged_labels.append(f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}")
-
-    if newly_logged_labels:
-        st.toast(f"Logged to Trade Log: {', '.join(newly_logged_labels)}", icon="✅")
+        st.toast(f"Logged to Trade Log: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="✅")
         # Plain st.rerun() from inside a fragment triggers a full-app rerun
         # (not just this fragment) - needed so the Trade Log tab's own
         # fragment picks up the new entry immediately instead of waiting
@@ -688,18 +697,11 @@ def render_trade_log_tab(access_token):
         st.write("")  # vertical spacer to align the button with the header
         if st.button("🧹 Clear All", key="clear_all_trades_btn", width='stretch', disabled=not trades):
             save_trade_log([])
-            # Also forget which instrument_keys were already logged this
-            # session, so re-ticking the same row in the Monthly/Weekly
-            # tables logs it again instead of being silently ignored as
-            # "already logged".
-            for k in list(st.session_state.keys()):
-                if k.startswith('logged_ids_'):
-                    st.session_state[k] = set()
             st.toast("Trade Log cleared.", icon="🧹")
             st.rerun()
 
     if not trades:
-        st.info("No trades logged yet. Tick a row's checkbox (left edge of the Monthly / Weekly tables) to log it here instantly.")
+        st.info("No trades logged yet. Use the 'Add to Trade Log' picker above the Monthly / Weekly CE/PE tables to log one here.")
         return
 
     trades_df = pd.DataFrame(trades)
@@ -718,46 +720,16 @@ def render_trade_log_tab(access_token):
     trades_df['CurrentLTP'] = trades_df['instrument_key'].map(ltp_cache)
     trades_df['CurrentLTP'] = trades_df['CurrentLTP'].fillna(trades_df['EntryPrice']).astype(float)
 
-    trades_df['P&L'] = trades_df['CurrentLTP'] - trades_df['EntryPrice']
-    safe_entry = trades_df['EntryPrice'].replace(0, pd.NA)
-    trades_df['P&L %'] = (trades_df['P&L'] / safe_entry) * 100
-    trades_df['P&L %'] = trades_df['P&L %'].fillna(0.0)
-
-    def _status(row):
-        if row['CurrentLTP'] >= row['TGT']:
-            return 'TGT HIT'
-        if row['CurrentLTP'] <= row['SL']:
-            return 'SL HIT'
-        return 'OPEN'
-
-    trades_df['Status'] = trades_df.apply(_status, axis=1)
-
     display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
-                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status']
-
-    def color_pnl(val):
-        if not isinstance(val, (int, float)):
-            return ''
-        if val > 0:
-            return 'color: #16a34a; font-weight: 700'
-        elif val < 0:
-            return 'color: #dc2626; font-weight: 700'
-        return ''
-
-    def color_status(val):
-        if val == 'TGT HIT':
-            return 'background-color: #bbf7d0; color: #15803d; font-weight: 700'
-        if val == 'SL HIT':
-            return 'background-color: #fecaca; color: #b91c1c; font-weight: 700'
-        return 'background-color: #dbeafe; color: #1d4ed8; font-weight: 700'
+                     'EntryTime', 'CurrentLTP', 'TGT', 'SL']
 
     styled = (
         trades_df[display_cols].style
-        .map(color_pnl, subset=['P&L', 'P&L %'])
-        .map(color_status, subset=['Status'])
+        .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
+        .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
         .format({
             'StrikePrice': '{:.2f}', 'EntryPrice': '{:.2f}', 'CurrentLTP': '{:.2f}',
-            'P&L': '{:.2f}', 'P&L %': '{:.2f}%'
+            'TGT': '{:.2f}', 'SL': '{:.2f}'
         })
         .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '15px'})
     )
@@ -845,6 +817,14 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
 
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
 
+    # Drop options whose Trigger price is below ₹3 — too cheap to be a
+    # meaningful/tradeable OTM candidate, so keep them out of the table,
+    # the movers panel, and the Telegram alerts entirely.
+    df = df[df['Trigger'] >= 3].copy()
+    if df.empty:
+        st.info("No rows with Trigger price ≥ ₹3.")
+        return
+
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
 
@@ -893,31 +873,23 @@ def display_option_chain(df, access_token, key_suffix, telegram_enabled=False, t
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
-        st.caption("☑️ Tick a row on the left to send it straight to the Trade Log")
-        calls_event = st.dataframe(
+        render_add_to_log_selector(calls_df, key_suffix, "CE")
+        st.dataframe(
             render_table(calls_df),
             hide_index=True,
             width='stretch',
             height=1800,
-            on_select="rerun",
-            selection_mode="multi-row",
-            key=f"{key_suffix}_ce_select"
         )
-        handle_row_tick_to_log(calls_df, key_suffix, "CE", calls_event)
 
     with col2:
         st.subheader("Lower Strike (PE)")
-        st.caption("☑️ Tick a row on the left to send it straight to the Trade Log")
-        puts_event = st.dataframe(
+        render_add_to_log_selector(puts_df, key_suffix, "PE")
+        st.dataframe(
             render_table(puts_df),
             hide_index=True,
             width='stretch',
             height=1800,
-            on_select="rerun",
-            selection_mode="multi-row",
-            key=f"{key_suffix}_pe_select"
         )
-        handle_row_tick_to_log(puts_df, key_suffix, "PE", puts_event)
 
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
