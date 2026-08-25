@@ -685,6 +685,60 @@ def render_add_to_log_selector(data_df, key_suffix, leg_label):
         st.rerun()
 
 
+def _update_trade_freeze_state(trade, current_ltp):
+    """
+    Confirms a TGT/SL hit only once it holds for 2 consecutive checks in a
+    row — a single touch of the level is treated as noise ("not valid") and
+    is ignored. Once confirmed, the trade is frozen: its LTP/P&L lock at
+    the confirming price permanently and it is never re-evaluated again,
+    even if price later moves back across TGT/SL.
+
+    Mutates `trade` in place (adds/updates 'pending_hit',
+    'pending_hit_count', 'frozen', 'frozen_status', 'frozen_ltp',
+    'frozen_time'). Returns True if `trade` was changed (so the caller
+    knows to persist it back to disk).
+    """
+    if trade.get('frozen'):
+        return False
+
+    try:
+        tgt = float(trade.get('TGT'))
+        sl = float(trade.get('SL'))
+    except (TypeError, ValueError):
+        return False
+
+    raw_hit = None
+    if current_ltp >= tgt:
+        raw_hit = 'TGT'
+    elif current_ltp <= sl:
+        raw_hit = 'SL'
+
+    prev_pending = trade.get('pending_hit')
+    prev_count = trade.get('pending_hit_count', 0)
+
+    if raw_hit is None:
+        if prev_pending is not None or prev_count:
+            trade['pending_hit'] = None
+            trade['pending_hit_count'] = 0
+            return True
+        return False
+
+    new_count = prev_count + 1 if raw_hit == prev_pending else 1
+    changed = (raw_hit != prev_pending) or (new_count != prev_count)
+
+    trade['pending_hit'] = raw_hit
+    trade['pending_hit_count'] = new_count
+
+    if new_count >= 2:
+        trade['frozen'] = True
+        trade['frozen_status'] = 'TGT HIT' if raw_hit == 'TGT' else 'SL HIT'
+        trade['frozen_ltp'] = current_ltp
+        trade['frozen_time'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
+        changed = True
+
+    return changed
+
+
 def render_trade_log_tab(access_token):
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
@@ -704,11 +758,12 @@ def render_trade_log_tab(access_token):
         st.info("No trades logged yet. Use the 'Add to Trade Log' picker above the Monthly / Weekly CE/PE tables to log one here.")
         return
 
-    trades_df = pd.DataFrame(trades)
+    st.caption("🔒 A TGT/SL hit freezes the trade (LTP/P&L locked) only after it holds for 2 consecutive refreshes — a single touch is ignored as noise.")
 
     # Live LTP for every logged instrument
     ltp_cache = load_ltp_cache()
-    inst_keys = trades_df['instrument_key'].dropna().unique().tolist()
+    inst_keys = [t.get('instrument_key') for t in trades if t.get('instrument_key')]
+    inst_keys = list(dict.fromkeys(inst_keys))  # dedupe, keep order
     if access_token and inst_keys:
         missing = [k for k in inst_keys if k not in ltp_cache]
         if missing:
@@ -717,19 +772,72 @@ def render_trade_log_tab(access_token):
                 save_ltp_cache(fetched)
                 ltp_cache = load_ltp_cache()
 
-    trades_df['CurrentLTP'] = trades_df['instrument_key'].map(ltp_cache)
-    trades_df['CurrentLTP'] = trades_df['CurrentLTP'].fillna(trades_df['EntryPrice']).astype(float)
+    def _live_ltp(inst_key, entry_price):
+        val = ltp_cache.get(inst_key)
+        try:
+            val = float(val)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+        return float(entry_price)
+
+    # --- TGT/SL hit confirmation + freeze (2 consecutive hits required) ---
+    any_changed = False
+    for t in trades:
+        live_ltp = _live_ltp(t.get('instrument_key'), t.get('EntryPrice'))
+        if _update_trade_freeze_state(t, live_ltp):
+            any_changed = True
+    if any_changed:
+        save_trade_log(trades)
+
+    trades_df = pd.DataFrame(trades)
+
+    def _row_current_ltp(row):
+        if row.get('frozen'):
+            return float(row.get('frozen_ltp', row['EntryPrice']))
+        return _live_ltp(row.get('instrument_key'), row['EntryPrice'])
+
+    trades_df['CurrentLTP'] = trades_df.apply(_row_current_ltp, axis=1)
+
+    trades_df['P&L'] = trades_df['CurrentLTP'] - trades_df['EntryPrice']
+    safe_entry = trades_df['EntryPrice'].replace(0, pd.NA)
+    trades_df['P&L %'] = (trades_df['P&L'] / safe_entry) * 100
+    trades_df['P&L %'] = trades_df['P&L %'].fillna(0.0)
+
+    def _status_label(row):
+        if row.get('frozen'):
+            return row.get('frozen_status', 'CLOSED')
+        return 'OPEN'
+
+    trades_df['Status'] = trades_df.apply(_status_label, axis=1)
 
     display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
-                     'EntryTime', 'CurrentLTP', 'TGT', 'SL']
+                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status']
+
+    def color_pnl(val):
+        if not isinstance(val, (int, float)):
+            return ''
+        if val > 0:
+            return 'color: #16a34a; font-weight: 700'
+        elif val < 0:
+            return 'color: #dc2626; font-weight: 700'
+        return ''
+
+    def color_status(val):
+        if val == 'TGT HIT':
+            return 'background-color: #bbf7d0; color: #15803d; font-weight: 700'
+        if val == 'SL HIT':
+            return 'background-color: #fecaca; color: #b91c1c; font-weight: 700'
+        return 'background-color: #dbeafe; color: #1d4ed8; font-weight: 700'
 
     styled = (
         trades_df[display_cols].style
-        .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
-        .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
+        .map(color_pnl, subset=['P&L', 'P&L %'])
+        .map(color_status, subset=['Status'])
         .format({
             'StrikePrice': '{:.2f}', 'EntryPrice': '{:.2f}', 'CurrentLTP': '{:.2f}',
-            'TGT': '{:.2f}', 'SL': '{:.2f}'
+            'P&L': '{:.2f}', 'P&L %': '{:.2f}%'
         })
         .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '15px'})
     )
