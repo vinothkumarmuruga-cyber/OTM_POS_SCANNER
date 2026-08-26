@@ -10,17 +10,13 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
-
 # IST Offset
 IST_OFFSET = timedelta(hours=5, minutes=30)
 IST = timezone(IST_OFFSET)
-
 def get_ist_now():
     return datetime.now(IST)
-
 # Set page configuration
 st.set_page_config(page_title="OTM Positional Scanner", layout="wide")
-
 # Custom CSS for compact layout
 st.markdown("""
     <style>
@@ -43,7 +39,6 @@ st.markdown("""
             padding-top: 0.1rem !important;
             margin-bottom: 0.1rem !important;
         }
-
         /* Prevent graying out during refresh */
         .stApp {
             transition: none !important;
@@ -52,7 +47,6 @@ st.markdown("""
             opacity: 1 !important;
             transition: none !important;
         }
-
         /* Hide File Uploader Instructions */
         [data-testid="stFileUploaderDropzone"] div div span {
            display: none !important;
@@ -60,12 +54,10 @@ st.markdown("""
         [data-testid="stFileUploaderDropzone"] div div small {
            display: none !important;
         }
-
         /* Force Dataframe Font Weight */
         div[data-testid="stDataFrame"] {
             font-weight: 600 !important;
         }
-
         /* Movers panel ("what changed since last refresh") */
         .movers-panel {
             border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; margin-bottom: 14px;
@@ -93,7 +85,6 @@ st.markdown("""
         .movers-detail { color: #475569; flex: 1; }
         .movers-delta-up { color: #16a34a; font-weight: 700; }
         .movers-delta-down { color: #dc2626; font-weight: 700; }
-
         /* Movers panel split into CE / PE columns */
         .movers-body { display: flex; }
         .movers-side { flex: 1; min-width: 0; }
@@ -106,30 +97,24 @@ st.markdown("""
         .movers-side .movers-sym { width: auto; margin-right: 4px; }
     </style>
 """, unsafe_allow_html=True)
-
 # Paths for persistent storage
 DATA_DIR = 'data'
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
-
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
 TRADE_LOG_FILE = os.path.join(DATA_DIR, 'trade_log.json')
-PINNED_FILE = os.path.join(DATA_DIR, 'pinned_stocks.json')
-
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
-
 # The Monthly / Weekly IV Excel files (produced by the IV Sheet Generator's
 # Monthly and Weekly tabs) replace the old NSE Bhavcopy ZIP as the input
 # files for this app.
 MONTHLY_IV_FILE = os.path.join(DATA_DIR, 'monthly_iv.xlsx')
 WEEKLY_IV_FILE = os.path.join(DATA_DIR, 'weekly_iv.xlsx')
-
 def load_meta():
     if os.path.exists(META_FILE):
         try:
@@ -138,7 +123,6 @@ def load_meta():
         except:
             pass
     return {}
-
 def save_meta(key, value):
     try:
         meta = load_meta()
@@ -147,7 +131,6 @@ def save_meta(key, value):
             json.dump(meta, f)
     except:
         pass
-
 def load_ltp_cache():
     if os.path.exists(LTP_CACHE_FILE):
         try:
@@ -156,7 +139,6 @@ def load_ltp_cache():
         except:
             pass
     return {}
-
 def save_ltp_cache(new_data):
     try:
         cache = load_ltp_cache()
@@ -165,7 +147,6 @@ def save_ltp_cache(new_data):
             json.dump(cache, f)
     except:
         pass
-
 def extract_expiry_from_filename(filename):
     """
     Extract an expiry date from a filename like 'Monthly IV 25AUG2026.xlsx'
@@ -179,7 +160,6 @@ def extract_expiry_from_filename(filename):
             return pd.to_datetime(match.group(1), format='%d%b%Y').normalize()
         except Exception:
             pass
-
     # Fallback: 8-digit date e.g. 20260825
     match8 = re.search(r'(\d{8})', filename)
     if match8:
@@ -188,9 +168,7 @@ def extract_expiry_from_filename(filename):
             return pd.to_datetime(f"{d[:4]}-{d[4:6]}-{d[6:]}").normalize()
         except Exception:
             pass
-
     return None
-
 def load_token():
     if os.path.exists(TOKEN_FILE):
         try:
@@ -201,7 +179,6 @@ def load_token():
         except:
             pass
     return ''
-
 def save_token(token):
     try:
         data = {
@@ -212,8 +189,6 @@ def save_token(token):
             json.dump(data, f)
     except:
         pass
-
-
 # ============================================================
 # TELEGRAM TRIGGER-ALERT STATE
 #
@@ -221,7 +196,6 @@ def save_token(token):
 # de-duplication survives Streamlit Cloud restarts / fragment
 # reruns. Resets automatically each new trading day.
 # ============================================================
-
 def load_trigger_alert_state():
     if os.path.exists(TRIGGER_ALERT_FILE):
         try:
@@ -232,7 +206,6 @@ def load_trigger_alert_state():
         except:
             pass
     return set()
-
 def save_trigger_alert_state(keys):
     try:
         data = {
@@ -243,8 +216,6 @@ def save_trigger_alert_state(keys):
             json.dump(data, f)
     except:
         pass
-
-
 # ============================================================
 # TRIGGERED-ON TIMESTAMPS (Monthly/Weekly CE/PE tables)
 #
@@ -259,7 +230,6 @@ def save_trigger_alert_state(keys):
 # IV Excel with a different expiry for that section (the old expiry's keys
 # simply stop being looked up).
 # ============================================================
-
 def load_trigger_time_state():
     if os.path.exists(TRIGGER_TIME_FILE):
         try:
@@ -268,7 +238,6 @@ def load_trigger_time_state():
         except:
             pass
     return {}
-
 def save_trigger_time_state(times):
     try:
         data = times
@@ -276,7 +245,6 @@ def save_trigger_time_state(times):
             json.dump(data, f)
     except:
         pass
-
 def clear_trigger_times_for_section(key_suffix):
     """
     Wipes every 'Triggered On' stamp recorded for this section (Monthly or
@@ -289,39 +257,6 @@ def clear_trigger_times_for_section(key_suffix):
     remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
     if len(remaining) != len(times):
         save_trigger_time_state(remaining)
-
-
-# ============================================================
-# PINNED STOCKS (Monthly/Weekly CE/PE tables)
-#
-# Lets you pin specific options so they always sort to the top of their
-# table, ahead of everything else (which still sorts by change % as
-# usual). Stored per section ("Monthly"/"Weekly") as a set of instrument
-# keys. Not date- or expiry-scoped - like a personal watchlist, a pin
-# stays put until you unpin it; if the underlying contract rolls to a new
-# expiry, that old instrument_key simply stops matching anything and the
-# pin quietly falls away on its own.
-# ============================================================
-
-def load_pinned_stocks():
-    if os.path.exists(PINNED_FILE):
-        try:
-            with open(PINNED_FILE, 'r') as f:
-                data = json.load(f)
-                return {section: set(keys) for section, keys in data.items()}
-        except:
-            pass
-    return {}
-
-def save_pinned_stocks(pinned_by_section):
-    try:
-        data = {section: list(keys) for section, keys in pinned_by_section.items()}
-        with open(PINNED_FILE, 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
-
-
 # ============================================================
 # TRADE LOG
 #
@@ -330,7 +265,6 @@ def save_pinned_stocks(pinned_by_section):
 # Kept separate from the live scan so the scan itself never has to
 # scroll — this is just the handful of positions actually taken.
 # ============================================================
-
 def load_trade_log():
     if os.path.exists(TRADE_LOG_FILE):
         try:
@@ -339,14 +273,12 @@ def load_trade_log():
         except:
             pass
     return []
-
 def save_trade_log(trades):
     try:
         with open(TRADE_LOG_FILE, 'w') as f:
             json.dump(trades, f)
     except:
         pass
-
 def add_trade(trade):
     trades = load_trade_log()
     trade = dict(trade)
@@ -354,13 +286,10 @@ def add_trade(trade):
     trades.append(trade)
     save_trade_log(trades)
     return trade['id']
-
 def remove_trade(trade_id):
     trades = load_trade_log()
     trades = [t for t in trades if t.get('id') != trade_id]
     save_trade_log(trades)
-
-
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -368,19 +297,15 @@ def _get_telegram_session():
     # Telegram on every single alert - shaves a meaningful chunk off how
     # long "Send Test" / a live alert takes to actually go out.
     return requests.Session()
-
-
 def send_telegram_alert(bot_token, chat_id, message):
     if not bot_token or not chat_id:
         return False, "Missing bot token or chat ID"
-
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": message,
         "parse_mode": "HTML"
     }
-
     try:
         response = _get_telegram_session().post(url, json=payload, timeout=10)
         if response.status_code == 200:
@@ -388,13 +313,16 @@ def send_telegram_alert(bot_token, chat_id, message):
         return False, f"HTTP {response.status_code}: {response.text[:200]}"
     except Exception as e:
         return False, f"Exception: {e}"
-
-
 def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_id, threshold_pct=85):
     """
     Sends a Telegram alert the moment an option's change % (LTP vs Trigger)
     reaches threshold_pct (default 85, i.e. 85% of the way to Trigger — not
     only a full 100% cross). Fires once per option per day.
+
+    key_suffix ("Monthly" or "Weekly") picks the bot_token/chat_id this
+    call was given, so Monthly and Weekly alerts are fully independent —
+    each section sends its own message to its own configured bot/chat,
+    never combined with the other section's rows.
 
     Alerts are suppressed before ALERT_START_TIME (09:30 IST) so the noisy
     opening minutes don't spam Telegram — but crucially, anything already
@@ -405,16 +333,12 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     """
     if not telegram_enabled:
         return
-
     if df.empty:
         return
-
     if 'instrument_key' not in df.columns:
         return
-
     ist_now = get_ist_now()
     alerted = load_trigger_alert_state()
-
     if ist_now.time() < ALERT_START_TIME:
         # Pre-market / opening-auction window: silently record anything
         # already at/above threshold so it's excluded once alerting turns
@@ -430,32 +354,24 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
                 continue
             if change_pct >= threshold_pct:
                 pre_seen.add(f"{key_suffix}:{inst_key}")
-
         if pre_seen - alerted:
             save_trigger_alert_state(alerted | pre_seen)
         return
-
     newly_triggered = []
-
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             continue
-
         alert_id = f"{key_suffix}:{inst_key}"
-
         try:
             change_pct = float(row.get('change %', 0.0))
         except:
             continue
-
         if change_pct >= threshold_pct and alert_id not in alerted:
             newly_triggered.append(row)
             alerted.add(alert_id)
-
     if not newly_triggered:
         return
-
     trigger_time_label = ist_now.strftime('%d-%b-%Y %H:%M:%S')
     header = f"🚀 <b>{threshold_pct:.0f}% Hit — {key_suffix}</b> · {trigger_time_label} IST"
     option_lines = [
@@ -464,7 +380,6 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     ]
     message = header + "\n" + "\n".join(option_lines)
     success, error = send_telegram_alert(bot_token, chat_id, message)
-
     if success:
         save_trigger_alert_state(alerted)
         # st.toast (not st.sidebar.success/warning): this function runs inside an
@@ -478,11 +393,8 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
         st.toast(f"📨 Telegram alert sent for {len(newly_triggered)} trigger cross(es) on {key_suffix}.", icon="✅")
     else:
         st.toast(f"⚠️ Telegram alert failed ({key_suffix}): {error}", icon="⚠️")
-
-
 # Constant for NSE JSON
 NSE_JSON_PATH = 'NSE.json'
-
 @st.cache_data
 def load_nse_json():
     if os.path.exists(NSE_JSON_PATH):
@@ -498,8 +410,6 @@ def load_nse_json():
     else:
         st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
-
-
 def process_iv_excel(excel_path, df_json, expiry_date):
     """
     Reads the Monthly IV Excel (from the IV Sheet Generator) and builds the
@@ -515,16 +425,13 @@ def process_iv_excel(excel_path, df_json, expiry_date):
     except Exception as e:
         st.error(f"Failed to read Monthly IV Excel: {e}")
         return pd.DataFrame()
-
     required_cols = ['NAME', 'UPPER STRIKE PRICE', 'UPPER STRIKE CLOSE PRICE',
                       'LOWER STRIKE PRICE', 'LOWER STRIKE CLOSE PRICE']
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         st.error(f"Uploaded Excel missing required columns: {missing}")
         return pd.DataFrame()
-
     df = df.dropna(subset=['NAME'])
-
     # Upper Strike -> CE leg
     upper = df[['NAME', 'UPPER STRIKE PRICE', 'UPPER STRIKE CLOSE PRICE']].copy()
     upper = upper.rename(columns={
@@ -533,7 +440,6 @@ def process_iv_excel(excel_path, df_json, expiry_date):
         'UPPER STRIKE CLOSE PRICE': 'Close'
     })
     upper['OptionType'] = 'CE'
-
     # Lower Strike -> PE leg
     lower = df[['NAME', 'LOWER STRIKE PRICE', 'LOWER STRIKE CLOSE PRICE']].copy()
     lower = lower.rename(columns={
@@ -542,25 +448,20 @@ def process_iv_excel(excel_path, df_json, expiry_date):
         'LOWER STRIKE CLOSE PRICE': 'Close'
     })
     lower['OptionType'] = 'PE'
-
     combined = pd.concat([upper, lower], ignore_index=True)
     combined = combined.dropna(subset=['StrikePrice', 'Close'])
     combined = combined[combined['StrikePrice'] > 0]
-
     if combined.empty:
         return pd.DataFrame()
-
     combined['ExpiryDate'] = expiry_date
     # Round to avoid float-precision mismatches on the merge key below
     combined['StrikePrice'] = combined['StrikePrice'].round(2)
-
     if df_json is None or df_json.empty:
         st.warning("NSE.json not loaded — cannot map instrument keys / fetch live LTP.")
         combined['instrument_key'] = None
     else:
         df_json = df_json.copy()
         df_json['strike_price'] = df_json['strike_price'].astype(float).round(2)
-
         merged = pd.merge(
             combined,
             df_json,
@@ -575,30 +476,22 @@ def process_iv_excel(excel_path, df_json, expiry_date):
                 "or update NSE.json."
             )
         combined = merged[['Symbol', 'StrikePrice', 'OptionType', 'Close', 'instrument_key']]
-
     # Trigger / Target calculation (User Rule)
     combined['Trigger'] = combined['Close'] * 2
     combined['TGT'] = combined['Trigger'] * 2
     combined['SL'] = combined['Trigger'] / 2
-
     return combined.reset_index(drop=True)
-
-
 def fetch_ltp(instrument_keys, token):
     if not token:
         return {}
-
     url = "https://api.upstox.com/v3/market-quote/ltp"
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {token}'
     }
-
     batch_size = 50
     ltp_map = {}
-
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
-
     def fetch_batch(batch):
         params = {'instrument_key': ','.join(batch)}
         try:
@@ -617,7 +510,6 @@ def fetch_ltp(instrument_keys, token):
         except Exception:
             pass
         return {}
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_batch, batch) for batch in batches]
         for future in concurrent.futures.as_completed(futures):
@@ -627,15 +519,10 @@ def fetch_ltp(instrument_keys, token):
                     ltp_map.update(batch_result)
             except Exception:
                 pass
-
     return ltp_map
-
-
 # An option counts as "triggered" once its change % (LTP vs Trigger) first
 # reaches this — i.e. LTP has actually reached the Trigger price itself.
 TRIGGERED_AT_PCT = 100.0
-
-
 def attach_trigger_times(df, key_suffix, expiry_date):
     """
     Stamps a 'Triggered On' column onto df: the date & time the option's
@@ -647,68 +534,53 @@ def attach_trigger_times(df, key_suffix, expiry_date):
     means a brand-new set of keys, so the old stamps simply stop applying).
     Persisted to disk so it survives refreshes/reruns. Blank ('—') until
     the option actually triggers.
-
     Format: "<day-of-month>&<hour>.<minute>" in 12-hour clock, e.g. a
     trigger at 13:35 IST on the 24th shows as "24&1.35" (the day/time it
     FIRST happened, not today's date).
     """
     times = load_trigger_time_state()
     changed = False
-
     now_dt = get_ist_now()
     hour_12 = now_dt.hour % 12
     if hour_12 == 0:
         hour_12 = 12
     now_label = f"{now_dt.day}&{hour_12}.{now_dt.minute:02d}"
-
     expiry_key = expiry_date.strftime('%Y-%m-%d') if expiry_date is not None else 'noexpiry'
-
     labels = []
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             labels.append('—')
             continue
-
         key = f"{key_suffix}:{expiry_key}:{inst_key}"
-
         if key in times:
             labels.append(times[key])
             continue
-
         try:
             change_pct = float(row.get('change %', 0.0))
         except:
             change_pct = 0.0
-
         if change_pct >= TRIGGERED_AT_PCT:
             times[key] = now_label
             changed = True
             labels.append(now_label)
         else:
             labels.append('—')
-
     if changed:
         save_trigger_time_state(times)
-
     df = df.copy()
     df['Triggered On'] = labels
     return df
-
-
 # Minimum move (in change % percentage points) for a row to be shown in
 # the "What Changed Since Last Refresh" movers panel — keeps the panel to
 # genuine movers instead of every tiny tick.
 MOVERS_MIN_DELTA = 1.0
 MOVERS_MAX_ROWS = 8
-
 # Movers panel only shows options whose CURRENT change % (LTP vs Trigger)
 # is within this band — too far below 75% isn't worth watching yet, and
 # above 125% is already well past Trigger.
 MOVERS_MIN_PCT = 75.0
 MOVERS_MAX_PCT = 125.0
-
-
 def compute_and_render_movers(df, key_suffix):
     """
     Compares the current change % for each instrument against the snapshot
@@ -721,26 +593,20 @@ def compute_and_render_movers(df, key_suffix):
     """
     snapshot_key = f'movers_prev_{key_suffix}'
     snapshot_time_key = f'movers_prev_time_{key_suffix}'
-
     prev_snapshot = st.session_state.get(snapshot_key, {})
     prev_time = st.session_state.get(snapshot_time_key)
-
     current_snapshot = {}
     ce_movers = []
     pe_movers = []
-
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             continue
-
         try:
             cur_change = float(row['change %'])
         except:
             continue
-
         current_snapshot[inst_key] = cur_change
-
         if inst_key in prev_snapshot:
             delta = cur_change - prev_snapshot[inst_key]
             # Only positive (upward) moves, and only within the 75%-125% band.
@@ -756,18 +622,14 @@ def compute_and_render_movers(df, key_suffix):
                     ce_movers.append(mover)
                 else:
                     pe_movers.append(mover)
-
     # Save this run's snapshot for the *next* refresh to compare against.
     st.session_state[snapshot_key] = current_snapshot
     st.session_state[snapshot_time_key] = get_ist_now()
-
     ce_movers.sort(key=lambda m: m['Delta'], reverse=True)
     pe_movers.sort(key=lambda m: m['Delta'], reverse=True)
     ce_movers = ce_movers[:MOVERS_MAX_ROWS]
     pe_movers = pe_movers[:MOVERS_MAX_ROWS]
-
     since_label = prev_time.strftime('%H:%M:%S') if prev_time else "—"
-
     def render_side(movers, label):
         side_html = [f'<div class="movers-side"><div class="movers-side-head">{label} &middot; {len(movers)} mover(s)</div>']
         if prev_time is None:
@@ -786,7 +648,6 @@ def compute_and_render_movers(df, key_suffix):
                 )
         side_html.append('</div>')
         return "".join(side_html)
-
     html = ['<div class="movers-panel">']
     html.append(
         f'<div class="movers-head"><span>WHAT CHANGED SINCE LAST REFRESH &middot; {since_label} IST</span>'
@@ -798,64 +659,6 @@ def compute_and_render_movers(df, key_suffix):
     html.append('</div>')
     html.append('</div>')
     st.markdown("".join(html), unsafe_allow_html=True)
-
-
-def render_pin_selector(data_df, key_suffix, leg_label):
-    """
-    A multiselect ABOVE the table for pinning specific options to the top
-    - not a clickable star INSIDE the table. The table itself is a colored
-    pandas Styler (change % tiers, TGT/SL highlighting), which can't host a
-    real interactive per-row control without losing that styling, and an
-    in-table click is easy to miss while the table keeps auto-refreshing
-    (the same reason "tick to log" was replaced earlier). A ★ column in
-    the table still shows which rows are pinned - it's just not what you
-    click.
-
-    Persisted to disk per section (Monthly/Weekly), so pins survive
-    refreshes/reruns and don't reset daily.
-
-    Returns the current set of pinned instrument_keys (as strings) for
-    THIS leg (CE or PE).
-    """
-    if data_df.empty:
-        return set()
-
-    all_pinned = load_pinned_stocks()
-    section_pinned = all_pinned.get(key_suffix, set())
-
-    # Only instrument_keys that actually exist in THIS leg's own data -
-    # keeps CE and PE (which share the same key_suffix bucket) from
-    # stepping on each other when we write back below.
-    leg_keys_by_label = {}
-    for idx in data_df.index:
-        row = data_df.loc[idx]
-        inst_key = row.get('instrument_key')
-        if inst_key is None or pd.isna(inst_key):
-            continue
-        label = f"{row['Symbol']} {row['StrikePrice']:.0f}"
-        leg_keys_by_label[label] = str(inst_key)
-
-    label_by_key = {v: k for k, v in leg_keys_by_label.items()}
-    default_labels = [label_by_key[k] for k in leg_keys_by_label.values() if k in section_pinned]
-
-    chosen_labels = st.multiselect(
-        "📌 Pin to top",
-        options=list(leg_keys_by_label.keys()),
-        default=default_labels,
-        key=f"{key_suffix}_{leg_label}_pin_select",
-    )
-
-    chosen_keys = {leg_keys_by_label[l] for l in chosen_labels if l in leg_keys_by_label}
-    prior_leg_keys = {k for k in leg_keys_by_label.values() if k in section_pinned}
-
-    if chosen_keys != prior_leg_keys:
-        updated_section = (section_pinned - set(leg_keys_by_label.values())) | chosen_keys
-        all_pinned[key_suffix] = updated_section
-        save_pinned_stocks(all_pinned)
-
-    return chosen_keys
-
-
 def render_add_to_log_selector(data_df, key_suffix, leg_label):
     """
     A stock-picker (selectbox) + "Add" button placed ABOVE the CE/PE table,
@@ -866,13 +669,10 @@ def render_add_to_log_selector(data_df, key_suffix, leg_label):
     if data_df.empty:
         st.caption("No rows available.")
         return
-
     options = list(data_df.index)
-
     def _fmt(idx):
         row = data_df.loc[idx]
         return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
-
     sel_col, btn_col = st.columns([4, 1])
     with sel_col:
         chosen_idx = st.selectbox(
@@ -884,14 +684,12 @@ def render_add_to_log_selector(data_df, key_suffix, leg_label):
         )
     with btn_col:
         add_clicked = st.button("➕ Add to Log", key=f"{key_suffix}_{leg_label}_add_btn", width='stretch')
-
     if add_clicked and chosen_idx is not None:
         row = data_df.loc[chosen_idx]
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             st.toast("Cannot log — missing instrument key.", icon="⚠️")
             return
-
         add_trade({
             'key_suffix': key_suffix,
             'Symbol': row['Symbol'],
@@ -910,8 +708,6 @@ def render_add_to_log_selector(data_df, key_suffix, leg_label):
         # fragment picks up the new entry immediately instead of waiting
         # for its next auto-refresh tick.
         st.rerun()
-
-
 def _update_trade_freeze_state(trade, current_ltp):
     """
     The moment an option's LTP first touches TGT or SL, the trade freezes
@@ -919,55 +715,44 @@ def _update_trade_freeze_state(trade, current_ltp):
     price right then and are never recalculated again, no matter what price
     does afterwards. A trade that is already frozen is a no-op here — later
     hits don't matter, the first one is final.
-
     Mutates `trade` in place (sets 'frozen', 'frozen_status', 'frozen_ltp',
     'frozen_time'). Returns True if `trade` was changed (so the caller
     knows to persist it back to disk).
     """
     if trade.get('frozen'):
         return False
-
     try:
         tgt = float(trade.get('TGT'))
         sl = float(trade.get('SL'))
     except (TypeError, ValueError):
         return False
-
     if current_ltp >= tgt:
         hit_status = 'TGT HIT'
     elif current_ltp <= sl:
         hit_status = 'SL HIT'
     else:
         return False
-
     trade['frozen'] = True
     trade['frozen_status'] = hit_status
     trade['frozen_ltp'] = current_ltp
     trade['frozen_time'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
     return True
-
-
 def render_trade_log_tab(access_token):
     header_col1, header_col2 = st.columns([5, 1])
     with header_col1:
         st.header("Trade Log")
         st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-
     trades = load_trade_log()
-
     with header_col2:
         st.write("")  # vertical spacer to align the button with the header
         if st.button("🧹 Clear All", key="clear_all_trades_btn", width='stretch', disabled=not trades):
             save_trade_log([])
             st.toast("Trade Log cleared.", icon="🧹")
             st.rerun()
-
     if not trades:
         st.info("No trades logged yet. Use the 'Add to Trade Log' picker above the Monthly / Weekly CE/PE tables to log one here.")
         return
-
     st.caption("🔒 The moment TGT or SL is hit, that trade's Status/LTP/P&L freeze for the rest of the day and never change again.")
-
     # Normalize legacy/partial trade dicts so every row has the same set of
     # freeze-related keys with real values (False/None), never a missing
     # key. This matters because pandas fills a missing dict key with NaN
@@ -979,7 +764,6 @@ def render_trade_log_tab(access_token):
         t.setdefault('frozen_status', None)
         t.setdefault('frozen_ltp', None)
         t.setdefault('frozen_time', None)
-
     # Live LTP for every logged instrument
     ltp_cache = load_ltp_cache()
     inst_keys = [t.get('instrument_key') for t in trades if t.get('instrument_key')]
@@ -991,7 +775,6 @@ def render_trade_log_tab(access_token):
             if fetched:
                 save_ltp_cache(fetched)
                 ltp_cache = load_ltp_cache()
-
     def _live_ltp(inst_key, entry_price):
         val = ltp_cache.get(inst_key)
         try:
@@ -1001,7 +784,6 @@ def render_trade_log_tab(access_token):
         except (TypeError, ValueError):
             pass
         return float(entry_price)
-
     # --- TGT/SL hit freeze (freezes instantly on the first hit) ---
     any_changed = False
     for t in trades:
@@ -1010,28 +792,21 @@ def render_trade_log_tab(access_token):
             any_changed = True
     if any_changed:
         save_trade_log(trades)
-
     trades_df = pd.DataFrame(trades)
-
     def _row_current_ltp(row):
         if row.get('frozen'):
             return float(row.get('frozen_ltp', row['EntryPrice']))
         return _live_ltp(row.get('instrument_key'), row['EntryPrice'])
-
     trades_df['CurrentLTP'] = trades_df.apply(_row_current_ltp, axis=1)
-
     trades_df['P&L'] = trades_df['CurrentLTP'] - trades_df['EntryPrice']
     safe_entry = trades_df['EntryPrice'].replace(0, pd.NA)
     trades_df['P&L %'] = (trades_df['P&L'] / safe_entry) * 100
     trades_df['P&L %'] = trades_df['P&L %'].fillna(0.0)
-
     def _status_label(row):
         if row.get('frozen'):
             return row.get('frozen_status', 'CLOSED')
         return 'OPEN'
-
     trades_df['Status'] = trades_df.apply(_status_label, axis=1)
-
     # When TGT/SL actually froze the trade — so a "TGT HIT"/"SL HIT" row
     # never leaves you guessing whether that happened today or was left
     # over from an earlier day the log wasn't cleared.
@@ -1039,12 +814,9 @@ def render_trade_log_tab(access_token):
         if row.get('frozen'):
             return row.get('frozen_time') or '—'
         return '—'
-
     trades_df['Triggered On'] = trades_df.apply(_triggered_on, axis=1)
-
     display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
                      'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status', 'Triggered On']
-
     def color_pnl(val):
         if not isinstance(val, (int, float)):
             return ''
@@ -1053,14 +825,12 @@ def render_trade_log_tab(access_token):
         elif val < 0:
             return 'color: #dc2626; font-weight: 700'
         return ''
-
     def color_status(val):
         if val == 'TGT HIT':
             return 'background-color: #bbf7d0; color: #15803d; font-weight: 700'
         if val == 'SL HIT':
             return 'background-color: #fecaca; color: #b91c1c; font-weight: 700'
         return 'background-color: #dbeafe; color: #1d4ed8; font-weight: 700'
-
     styled = (
         trades_df[display_cols].style
         .map(color_pnl, subset=['P&L', 'P&L %'])
@@ -1071,12 +841,9 @@ def render_trade_log_tab(access_token):
         })
         .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '15px'})
     )
-
     st.dataframe(styled, hide_index=True, width='stretch')
-
     st.markdown("---")
     st.subheader("Remove a Trade")
-
     remove_col_a, remove_col_b = st.columns([3, 1])
     with remove_col_a:
         remove_choice = st.selectbox(
@@ -1095,32 +862,23 @@ def render_trade_log_tab(access_token):
             remove_trade(remove_choice)
             st.toast("Trade removed from log.", icon="🗑️")
             st.rerun()
-
-
 def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info("No data to display. Please upload a valid Monthly IV Excel in the sidebar.")
         return
-
     # Fetch LTP if token provided
     if access_token:
         all_keys = df['instrument_key'].dropna().unique().tolist()
-
         ist_now = get_ist_now()
         current_time = ist_now.time()
         start_time = datetime.strptime("09:00", "%H:%M").time()
         end_time = datetime.strptime("15:40", "%H:%M").time()
-
         is_market_hours = start_time <= current_time <= end_time
-
         ltp_cache = load_ltp_cache()
         missing_keys = [k for k in all_keys if k not in ltp_cache]
-
         force_refresh = st.session_state.get('force_refresh_ltp', False)
-
         should_fetch = False
-
         if is_market_hours:
             should_fetch = True
         elif force_refresh:
@@ -1128,20 +886,17 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             st.session_state['force_refresh_ltp'] = False
         elif missing_keys:
             should_fetch = True
-
         if should_fetch:
             keys_to_fetch = all_keys if is_market_hours else missing_keys
             fetched_data = fetch_ltp(keys_to_fetch, access_token)
             if fetched_data:
                 save_ltp_cache(fetched_data)
                 ltp_cache = load_ltp_cache()
-
         ltp_data = {k: ltp_cache.get(k, 0.0) for k in all_keys}
         df['ltp'] = df['instrument_key'].map(ltp_data).fillna(0.0)
     else:
         df['ltp'] = 0.0
         st.warning("Enter Access Token in sidebar to see live LTP.")
-
     # Calculate Change % (LTP vs Trigger)
     def calculate_numeric_change(row):
         try:
@@ -1152,9 +907,7 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             return 0.0
         except:
             return 0.0
-
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
-
     # Drop options whose Trigger price is below ₹3 — too cheap to be a
     # meaningful/tradeable OTM candidate, so keep them out of the table,
     # the movers panel, and the Telegram alerts entirely.
@@ -1162,25 +915,20 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     if df.empty:
         st.info("No rows with Trigger price ≥ ₹3.")
         return
-
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
+    # bot_token/chat_id passed in are section-specific (Monthly vs Weekly),
+    # so each section's alerts go to its own configured Telegram bot/chat.
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
-
     # --- What Changed Since Last Refresh ---
     compute_and_render_movers(df, key_suffix)
-
     # --- Triggered On (first time change % reached 100%, i.e. LTP hit Trigger) ---
     df = attach_trigger_times(df, key_suffix, expiry_date)
-
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
     puts_df = df[df['OptionType'] == 'PE'].copy()
-
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
-
-    display_cols = ['★', 'Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
-
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
         # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
@@ -1191,12 +939,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         elif val >= 90:
             return 'background-color: lightgreen; color: black; font-weight: 700'
         return ''
-
-    def color_pin(val):
-        if val == '★':
-            return 'color: #f59e0b; font-weight: 700'
-        return 'color: #cbd5e1'
-
     format_dict = {
         'change %': '{:.2f}%',
         'Trigger': '{:.2f}',
@@ -1205,34 +947,19 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
     }
-
     def render_table(data_df):
         return (
             data_df[display_cols].style
             .map(color_change, subset=['change %'])
-            .map(color_pin, subset=['★'])
             .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
             .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
         )
-
-    def apply_pins(data_df, pinned_keys):
-        # Adds the ★/☆ indicator column and bubbles pinned rows to the top,
-        # with everyone else still sorted by change % as usual underneath.
-        data_df = data_df.copy()
-        data_df['★'] = data_df['instrument_key'].apply(
-            lambda k: '★' if (k is not None and not pd.isna(k) and str(k) in pinned_keys) else '☆'
-        )
-        data_df['_is_pinned'] = (data_df['★'] == '★')
-        data_df = data_df.sort_values(by=['_is_pinned', 'change %'], ascending=[False, False])
-        return data_df
-
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
-        ce_pinned = render_pin_selector(calls_df, key_suffix, "CE")
-        calls_df = apply_pins(calls_df, ce_pinned)
+        calls_df = calls_df.sort_values(by='change %', ascending=False)
         render_add_to_log_selector(calls_df, key_suffix, "CE")
         st.dataframe(
             render_table(calls_df),
@@ -1240,11 +967,9 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             width='stretch',
             height=1800,
         )
-
     with col2:
         st.subheader("Lower Strike (PE)")
-        pe_pinned = render_pin_selector(puts_df, key_suffix, "PE")
-        puts_df = apply_pins(puts_df, pe_pinned)
+        puts_df = puts_df.sort_values(by='change %', ascending=False)
         render_add_to_log_selector(puts_df, key_suffix, "PE")
         st.dataframe(
             render_table(puts_df),
@@ -1252,7 +977,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             width='stretch',
             height=1800,
         )
-
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
 # (e.g. running locally without one configured) - default to Admin view in that case.
@@ -1260,7 +984,6 @@ try:
     is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
 except Exception:
     is_client_view = False
-
 if is_client_view:
     access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
     st.markdown("""
@@ -1268,91 +991,99 @@ if is_client_view:
         [data-testid="stSidebar"] {display: none;}
     </style>
     """, unsafe_allow_html=True)
-
     auto_refresh = True
     refresh_interval = 15
-
-    telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
-    telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
-    alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT", 85.0))
-
+    # Monthly and Weekly each get their own bot/chat, falling back to the
+    # shared TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / ALERT_THRESHOLD_PCT
+    # secrets if a section-specific one isn't set.
+    monthly_telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN_MONTHLY", st.secrets.get("TELEGRAM_BOT_TOKEN", ""))
+    monthly_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_MONTHLY", st.secrets.get("TELEGRAM_CHAT_ID", ""))
+    monthly_telegram_enabled = bool(monthly_telegram_bot_token and monthly_telegram_chat_id)
+    monthly_alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT_MONTHLY", st.secrets.get("ALERT_THRESHOLD_PCT", 85.0)))
+    weekly_telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN_WEEKLY", st.secrets.get("TELEGRAM_BOT_TOKEN", ""))
+    weekly_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_WEEKLY", st.secrets.get("TELEGRAM_CHAT_ID", ""))
+    weekly_telegram_enabled = bool(weekly_telegram_bot_token and weekly_telegram_chat_id)
+    weekly_alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT_WEEKLY", st.secrets.get("ALERT_THRESHOLD_PCT", 85.0)))
 else:
     with st.sidebar:
         st.header("Configuration")
-
         saved_token = load_token()
         access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
-
         if access_token and access_token != saved_token:
             save_token(access_token)
-
         st.markdown("---")
         st.header("Telegram Alerts")
-
-        telegram_enabled = st.checkbox(
-            "Enable Trigger Alerts",
-            value=st.session_state.get('telegram_enabled', False),
-            key='telegram_enabled',
-            help="Sends a Telegram message once an option's change % (LTP vs Trigger) reaches the threshold below. Alerts only start firing from 09:30 AM IST onward."
-        )
-
-        alert_threshold_pct = st.number_input(
-            "Alert Threshold (%)",
-            min_value=1.0,
-            max_value=300.0,
-            value=st.session_state.get('alert_threshold_pct', 85.0),
-            step=1.0,
-            key='alert_threshold_pct',
-            help="Telegram alert fires once change % reaches this value (default 85, i.e. before the full 100% Trigger cross)."
-        )
-
         st.caption("🕤 Alerts are silent before 09:30 AM IST, then active for the rest of the day.")
-
-        telegram_bot_token = st.text_input(
-            "Bot Token",
-            type="password",
-            value=st.session_state.get('telegram_bot_token', ''),
-            key='telegram_bot_token',
-            help="Create a bot via @BotFather on Telegram to get this token."
-        )
-
-        telegram_chat_id = st.text_input(
-            "Chat ID",
-            value=st.session_state.get('telegram_chat_id', ''),
-            key='telegram_chat_id',
-            help="Your personal or group chat ID. Message @userinfobot to find yours."
-        )
-
-        tg_col1, tg_col2 = st.columns(2)
-        test_telegram_clicked = tg_col1.button("Send Test", use_container_width=True)
-        reset_alert_state_clicked = tg_col2.button("Reset Alerts", use_container_width=True)
-
-        if reset_alert_state_clicked:
-            save_trigger_alert_state(set())
-            st.success("Alert state cleared — already-triggered options will alert again.")
-
-        if test_telegram_clicked:
-            success, error = send_telegram_alert(
-                telegram_bot_token,
-                telegram_chat_id,
-                "✅ Test alert from OTM Positional Scanner — Telegram is wired up correctly."
+        def render_telegram_section(section_prefix, section_label):
+            """
+            Renders one section's (Monthly or Weekly) independent Telegram
+            config: its own enable checkbox, threshold, bot token, chat ID
+            and test button - so Monthly and Weekly alerts can go to
+            completely different Telegram bots/chats and never get mixed
+            into the same message.
+            Returns (enabled, bot_token, chat_id, threshold_pct).
+            """
+            st.subheader(f"{section_label}")
+            enabled = st.checkbox(
+                f"Enable {section_label} Trigger Alerts",
+                value=st.session_state.get(f'{section_prefix}_telegram_enabled', False),
+                key=f'{section_prefix}_telegram_enabled',
+                help=f"Sends a Telegram message once a {section_label} option's change % (LTP vs Trigger) reaches the threshold below."
             )
-            if success:
-                st.success("Test message sent — check Telegram.")
-            else:
-                st.error(f"Test message failed: {error}")
-
+            threshold_pct = st.number_input(
+                "Alert Threshold (%)",
+                min_value=1.0,
+                max_value=300.0,
+                value=st.session_state.get(f'{section_prefix}_alert_threshold_pct', 85.0),
+                step=1.0,
+                key=f'{section_prefix}_alert_threshold_pct',
+                help="Telegram alert fires once change % reaches this value (default 85, i.e. before the full 100% Trigger cross)."
+            )
+            bot_token = st.text_input(
+                "Bot Token",
+                type="password",
+                value=st.session_state.get(f'{section_prefix}_telegram_bot_token', ''),
+                key=f'{section_prefix}_telegram_bot_token',
+                help="Create a bot via @BotFather on Telegram to get this token."
+            )
+            chat_id = st.text_input(
+                "Chat ID",
+                value=st.session_state.get(f'{section_prefix}_telegram_chat_id', ''),
+                key=f'{section_prefix}_telegram_chat_id',
+                help="Your personal or group chat ID. Message @userinfobot to find yours."
+            )
+            tg_col1, tg_col2 = st.columns(2)
+            test_clicked = tg_col1.button("Send Test", use_container_width=True, key=f'{section_prefix}_test_btn')
+            reset_clicked = tg_col2.button("Reset Alerts", use_container_width=True, key=f'{section_prefix}_reset_btn')
+            if reset_clicked:
+                # Alert-dedup keys are namespaced "Monthly:..."/"Weekly:...",
+                # so only this section's already-triggered options are
+                # cleared - the other section's alert history is untouched.
+                alerted = load_trigger_alert_state()
+                remaining = {k for k in alerted if not k.startswith(f"{section_label}:")}
+                save_trigger_alert_state(remaining)
+                st.success(f"{section_label} alert state cleared — already-triggered options will alert again.")
+            if test_clicked:
+                success, error = send_telegram_alert(
+                    bot_token,
+                    chat_id,
+                    f"✅ Test alert from OTM Positional Scanner ({section_label}) — Telegram is wired up correctly."
+                )
+                if success:
+                    st.success("Test message sent — check Telegram.")
+                else:
+                    st.error(f"Test message failed: {error}")
+            return enabled, bot_token, chat_id, threshold_pct
+        monthly_telegram_enabled, monthly_telegram_bot_token, monthly_telegram_chat_id, monthly_alert_threshold_pct = render_telegram_section('monthly', 'Monthly')
+        st.markdown("---")
+        weekly_telegram_enabled, weekly_telegram_bot_token, weekly_telegram_chat_id, weekly_alert_threshold_pct = render_telegram_section('weekly', 'Weekly')
         st.markdown("---")
         st.header("Data Management")
-
         if st.button("⚡ Refresh LTP Now", use_container_width=True):
             st.session_state['force_refresh_ltp'] = True
             st.rerun()
-
         # NSE JSON Uploader
         st.subheader("NSE Instrument JSON")
-
         if st.button("🔄 Download Latest"):
             try:
                 with st.spinner("Downloading latest NSE.json from Upstox..."):
@@ -1373,9 +1104,7 @@ else:
                         st.error(f"Failed to download. Status: {response.status_code}")
             except Exception as e:
                 st.error(f"Error: {e}")
-
         st.markdown("---")
-
         def render_iv_upload_section(section_key, file_path, meta_file_key, meta_expiry_key, label, example_name, trigger_key_suffix):
             """
             Renders one Upload + Confirm Expiry block (used for both the
@@ -1407,17 +1136,14 @@ else:
                 # once per GENUINE new upload.
                 upload_marker = getattr(up_iv, 'file_id', None) or f"{up_iv.name}:{up_iv.size}"
                 processed_key = f'{section_key}_last_processed_upload'
-
                 if st.session_state.get(processed_key) != upload_marker:
                     with open(file_path, "wb") as f:
                         f.write(up_iv.getvalue())
                     save_meta(meta_file_key, up_iv.name)
-
                     # A genuinely new file for this section always starts
                     # Triggered On fresh - no ambiguity about whether a
                     # stamp is a real same-day trigger or a stale leftover.
                     clear_trigger_times_for_section(trigger_key_suffix)
-
                     detected_expiry = extract_expiry_from_filename(up_iv.name)
                     if detected_expiry is not None:
                         save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
@@ -1431,20 +1157,15 @@ else:
                         st.success(f"Uploaded {up_iv.name} — Expiry detected: {detected_expiry.strftime('%d-%b-%Y')}")
                     else:
                         st.warning(f"Uploaded {up_iv.name} — could not auto-detect expiry from filename. Please confirm it below.")
-
                     st.session_state[processed_key] = upload_marker
-
             meta = load_meta()
-
             if os.path.exists(file_path):
                 st.caption(f"📄 File: {meta.get(meta_file_key, os.path.basename(file_path))}")
-
                 stored_expiry_str = meta.get(meta_expiry_key)
                 try:
                     default_expiry_date = datetime.strptime(stored_expiry_str, '%Y-%m-%d').date() if stored_expiry_str else get_ist_now().date()
                 except Exception:
                     default_expiry_date = get_ist_now().date()
-
                 manual_expiry = st.date_input(
                     "Confirm Expiry Date",
                     value=default_expiry_date,
@@ -1452,7 +1173,6 @@ else:
                     help="Must match the option expiry exactly, so it can be matched against NSE.json."
                 )
                 save_meta(meta_expiry_key, manual_expiry.strftime('%Y-%m-%d'))
-
         # Monthly IV Excel Uploader (replaces the old Bhavcopy ZIP upload)
         render_iv_upload_section(
             section_key='monthly',
@@ -1463,9 +1183,7 @@ else:
             example_name='Monthly IV 25AUG2026.xlsx',
             trigger_key_suffix='Monthly'
         )
-
         st.markdown("---")
-
         # Weekly IV Excel Uploader
         render_iv_upload_section(
             section_key='weekly',
@@ -1476,17 +1194,13 @@ else:
             example_name='Weekly IV 29AUG2026.xlsx',
             trigger_key_suffix='Weekly'
         )
-
         st.markdown("---")
         st.header("Auto Refresh")
         auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
         refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
-
 # --- Main Page ---
 st.title("OTM Positional Scanner")
-
 nse_json_df = load_nse_json()
-
 def get_target_expiry(meta_expiry_key):
     meta = load_meta()
     expiry_str = meta.get(meta_expiry_key)
@@ -1496,53 +1210,39 @@ def get_target_expiry(meta_expiry_key):
         except Exception:
             return None
     return None
-
 if not nse_json_df.empty:
     tab_monthly, tab_weekly, tab_tradelog = st.tabs(["📅 Monthly", "🗓️ Weekly", "📒 Trade Log"])
-
     with tab_monthly:
         st.header("Monthly Options")
-
         target_expiry_m = get_target_expiry('MonthlyIVExpiry')
-
         if os.path.exists(MONTHLY_IV_FILE) and target_expiry_m is not None:
             st.info(f"📅 Displaying Expiry: **{target_expiry_m.strftime('%d-%b-%Y')}**")
-
             run_every = refresh_interval if auto_refresh else None
-
             @st.fragment(run_every=run_every)
             def show_monthly():
                 df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
-                display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=telegram_enabled, telegram_bot_token=telegram_bot_token, telegram_chat_id=telegram_chat_id, alert_threshold_pct=alert_threshold_pct)
+                display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=monthly_telegram_enabled, telegram_bot_token=monthly_telegram_bot_token, telegram_chat_id=monthly_telegram_chat_id, alert_threshold_pct=monthly_alert_threshold_pct)
             show_monthly()
         else:
             st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
-
     with tab_weekly:
         st.header("Weekly Options")
-
         target_expiry_w = get_target_expiry('WeeklyIVExpiry')
-
         if os.path.exists(WEEKLY_IV_FILE) and target_expiry_w is not None:
             st.info(f"📅 Displaying Expiry: **{target_expiry_w.strftime('%d-%b-%Y')}**")
-
             run_every = refresh_interval if auto_refresh else None
-
             @st.fragment(run_every=run_every)
             def show_weekly():
                 df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
-                display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=telegram_enabled, telegram_bot_token=telegram_bot_token, telegram_chat_id=telegram_chat_id, alert_threshold_pct=alert_threshold_pct)
+                display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=weekly_telegram_enabled, telegram_bot_token=weekly_telegram_bot_token, telegram_chat_id=weekly_telegram_chat_id, alert_threshold_pct=weekly_alert_threshold_pct)
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
-
     with tab_tradelog:
         run_every = refresh_interval if auto_refresh else None
-
         @st.fragment(run_every=run_every)
         def show_trade_log():
             render_trade_log_tab(access_token)
         show_trade_log()
-
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
