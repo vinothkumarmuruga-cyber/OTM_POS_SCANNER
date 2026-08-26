@@ -390,81 +390,18 @@ def send_telegram_alert(bot_token, chat_id, message):
         return False, f"Exception: {e}"
 
 
-# --- Tiered Telegram alert ladder ---
-# APPROACHING/NEAR/HIT all sit on the same change % (LTP vs Trigger) ladder;
-# SL is an independent, straight LTP<=SL price check (a risk/exit signal,
-# not a step on the way up). Each tier fires at most once per option per
-# day, so as a trade progresses through the day you get the whole story
-# instead of a single ping.
-APPROACHING_PCT = 75.0
-
-TIER_ORDER = ['APPROACHING', 'NEAR', 'HIT', 'SL']
-TIER_META = {
-    'APPROACHING': {
-        'emoji': '🔵',
-        'title': 'Approaching',
-        'line': lambda r: f"Change % reached {r['change %']:.0f}% of Trigger. Worth a look.",
-    },
-    'NEAR': {
-        'emoji': '🟡',
-        'title': 'Near Trigger',
-        'line': lambda r: f"Change % reached {r['change %']:.0f}%. LTP {r['ltp']:.2f}, Trigger {r['Trigger']:.2f}.",
-    },
-    'HIT': {
-        'emoji': '🟢',
-        'title': 'Trigger Hit',
-        'line': lambda r: f"LTP {r['ltp']:.2f} crossed Trigger {r['Trigger']:.2f}. TGT is {r['TGT']:.2f}.",
-    },
-    'SL': {
-        'emoji': '🔴',
-        'title': 'SL Hit',
-        'line': lambda r: f"LTP {r['ltp']:.2f} fell through SL {r['SL']:.2f}. Consider exit.",
-    },
-}
-
-
-def _evaluate_alert_tiers(row, near_trigger_pct):
-    """
-    Returns every tier ('APPROACHING'/'NEAR'/'HIT'/'SL') that currently
-    applies to this option row. A fast-moving row can satisfy more than one
-    at once (e.g. a gap-up straight past 100%) - the caller only actually
-    fires whichever of these haven't already been alerted today, so a big
-    jump still reports every tier it passed through instead of skipping
-    straight to the top one.
-    """
-    try:
-        change_pct = float(row.get('change %', 0.0))
-        ltp = float(row.get('ltp', 0.0))
-        sl = float(row.get('SL', 0.0))
-    except (TypeError, ValueError):
-        return []
-
-    tiers = []
-    if change_pct >= APPROACHING_PCT:
-        tiers.append('APPROACHING')
-    if change_pct >= near_trigger_pct:
-        tiers.append('NEAR')
-    if change_pct >= TRIGGERED_AT_PCT:
-        tiers.append('HIT')
-    if ltp > 0 and sl > 0 and ltp <= sl:
-        tiers.append('SL')
-    return tiers
-
-
 def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_id, threshold_pct=85):
     """
-    Sends tiered Telegram alerts as each option climbs the ladder:
-    Approaching (>= APPROACHING_PCT) -> Near Trigger (>= threshold_pct,
-    the sidebar-configurable "Near Trigger" setting) -> Trigger Hit (LTP
-    has actually reached the Trigger price) - plus an independent SL Hit
-    alert the moment LTP falls to/below SL. Each tier fires at most once
-    per option per day, as its own separate message.
+    Sends a Telegram alert the moment an option's change % (LTP vs Trigger)
+    reaches threshold_pct (default 85, i.e. 85% of the way to Trigger — not
+    only a full 100% cross). Fires once per option per day.
 
     Alerts are suppressed before ALERT_START_TIME (09:30 IST) so the noisy
     opening minutes don't spam Telegram — but crucially, anything already
-    qualifying for a tier *before* 09:30 is silently marked as "seen"
+    at/above threshold_pct *before* 09:30 is silently marked as "seen"
     (never actually messaged) so it doesn't get dumped as a fake "just
-    crossed" batch the instant the clock ticks past 09:30.
+    crossed" alert the instant the clock ticks past 09:30. Only strikes
+    that genuinely cross the threshold AFTER 09:30 ever produce a message.
     """
     if not telegram_enabled:
         return
@@ -477,72 +414,68 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
 
     ist_now = get_ist_now()
     alerted = load_trigger_alert_state()
-    pre_market = ist_now.time() < ALERT_START_TIME
 
-    newly_triggered = {tier: [] for tier in TIER_ORDER}
+    if ist_now.time() < ALERT_START_TIME:
+        # Pre-market / opening-auction window: silently record anything
+        # already at/above threshold so it's excluded once alerting turns
+        # on at 09:30, instead of firing in a batch right at that moment.
+        pre_seen = set()
+        for _, row in df.iterrows():
+            inst_key = row.get('instrument_key')
+            if not inst_key or pd.isna(inst_key):
+                continue
+            try:
+                change_pct = float(row.get('change %', 0.0))
+            except:
+                continue
+            if change_pct >= threshold_pct:
+                pre_seen.add(f"{key_suffix}:{inst_key}")
+
+        if pre_seen - alerted:
+            save_trigger_alert_state(alerted | pre_seen)
+        return
+
+    newly_triggered = []
 
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             continue
 
-        for tier in _evaluate_alert_tiers(row, threshold_pct):
-            alert_id = f"{tier}:{key_suffix}:{inst_key}"
-            if alert_id in alerted:
-                continue
-            alerted.add(alert_id)
-            if not pre_market:
-                newly_triggered[tier].append(row)
+        alert_id = f"{key_suffix}:{inst_key}"
 
-    if pre_market:
-        # Nothing is ever messaged before 09:30 - just record what already
-        # qualifies so it's excluded once alerting turns on at 09:30.
-        save_trigger_alert_state(alerted)
-        return
-
-    if not any(newly_triggered.values()):
-        return
-
-    trigger_time_label = ist_now.strftime('%d-%b-%Y %H:%M:%S')
-    persist_ids = set()
-
-    for tier in TIER_ORDER:
-        rows = newly_triggered[tier]
-        if not rows:
+        try:
+            change_pct = float(row.get('change %', 0.0))
+        except:
             continue
 
-        meta = TIER_META[tier]
-        header = f"{meta['emoji']} <b>{meta['title']} — {key_suffix}</b> · {trigger_time_label} IST"
-        lines = [
-            f"{r['Symbol']} {r['StrikePrice']:.0f} {r['OptionType']} | {meta['line'](r)}"
-            for r in rows
-        ]
-        message = header + "\n" + "\n".join(lines)
-        success, error = send_telegram_alert(bot_token, chat_id, message)
+        if change_pct >= threshold_pct and alert_id not in alerted:
+            newly_triggered.append(row)
+            alerted.add(alert_id)
 
-        if success:
-            for r in rows:
-                persist_ids.add(f"{tier}:{key_suffix}:{r['instrument_key']}")
-            # st.toast (not st.sidebar.success/warning): this function runs inside an
-            # @st.fragment (show_monthly/show_weekly). Writing to st.sidebar - a
-            # container outside the fragment's own tree - from inside a fragment
-            # raises StreamlitAPIException ("container was not written to during
-            # the initial run") and aborts the fragment mid-run, which is why the
-            # option tables were disappearing whenever an alert fired. st.toast()
-            # is a floating overlay that doesn't need a reserved container, so it's
-            # safe to call from any fragment.
-            st.toast(f"📨 {meta['title']} alert sent for {len(rows)} option(s) on {key_suffix}.", icon="✅")
-        else:
-            st.toast(f"⚠️ {meta['title']} alert failed ({key_suffix}): {error}", icon="⚠️")
+    if not newly_triggered:
+        return
 
-    if persist_ids:
-        # Only persist the tiers that actually sent successfully - re-load
-        # fresh state first so a hiccup on one tier doesn't get silently
-        # marked "already alerted" (it'll simply retry next refresh), and
-        # so this doesn't clobber whatever the OTHER key_suffix's fragment
-        # (Monthly vs Weekly) may have written to the same file meanwhile.
-        current = load_trigger_alert_state()
-        save_trigger_alert_state(current | persist_ids)
+    option_lines = [
+        f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} | LTP {row['ltp']:.2f} | Trig {row['Trigger']:.2f}"
+        for row in newly_triggered
+    ]
+    message = "\n".join(option_lines)
+    success, error = send_telegram_alert(bot_token, chat_id, message)
+
+    if success:
+        save_trigger_alert_state(alerted)
+        # st.toast (not st.sidebar.success/warning): this function runs inside an
+        # @st.fragment (show_monthly/show_weekly). Writing to st.sidebar - a
+        # container outside the fragment's own tree - from inside a fragment
+        # raises StreamlitAPIException ("container was not written to during
+        # the initial run") and aborts the fragment mid-run, which is why the
+        # option tables were disappearing whenever an alert fired. st.toast()
+        # is a floating overlay that doesn't need a reserved container, so it's
+        # safe to call from any fragment.
+        st.toast(f"📨 Telegram alert sent for {len(newly_triggered)} trigger cross(es) on {key_suffix}.", icon="✅")
+    else:
+        st.toast(f"⚠️ Telegram alert failed ({key_suffix}): {error}", icon="⚠️")
 
 
 # Constant for NSE JSON
@@ -865,60 +798,72 @@ def compute_and_render_movers(df, key_suffix):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def render_pin_selector(data_df, key_suffix, leg_label):
+def render_pinnable_table(data_df, key_suffix, leg_label):
     """
-    A multiselect ABOVE the table for pinning specific options to the top
-    - not a clickable star INSIDE the table. The table itself is a colored
-    pandas Styler (change % tiers, TGT/SL highlighting), which can't host a
-    real interactive per-row control without losing that styling, and an
-    in-table click is easy to miss while the table keeps auto-refreshing
-    (the same reason "tick to log" was replaced earlier). A ★ column in
-    the table still shows which rows are pinned - it's just not what you
-    click.
+    Renders the CE/PE table with a directly clickable 📌 Pin checkbox
+    column (st.data_editor) - click it and that row is pinned/unpinned
+    immediately, no separate picker. Persisted to disk per section
+    (Monthly/Weekly), so pins survive refreshes/reruns and don't reset
+    daily. Pinned rows sort to the top; everyone else stays sorted by
+    change % underneath, same as before.
 
-    Persisted to disk per section (Monthly/Weekly), so pins survive
-    refreshes/reruns and don't reset daily.
+    Trade-off (a real Streamlit limitation, chosen deliberately): a truly
+    clickable in-table checkbox requires st.data_editor, which can't
+    render a pandas Styler - so this table no longer has the colored
+    change % tiers / TGT-blue / SL-red backgrounds the old Styler-based
+    table had. change % keeps a progress-bar visual instead, which still
+    conveys magnitude at a glance.
 
-    Returns the current set of pinned instrument_keys (as strings) for
-    THIS leg (CE or PE).
+    Uses instrument_key as the table's row INDEX (not the default
+    positional index) so Streamlit correctly tracks which row got edited
+    even though row order/content changes on every refresh - editing by
+    position alone is exactly what made the old row-tick-to-log feature
+    unreliable.
     """
     if data_df.empty:
-        return set()
+        st.info("No rows to display.")
+        return
 
     all_pinned = load_pinned_stocks()
     section_pinned = all_pinned.get(key_suffix, set())
 
-    # Only instrument_keys that actually exist in THIS leg's own data -
-    # keeps CE and PE (which share the same key_suffix bucket) from
-    # stepping on each other when we write back below.
-    leg_keys_by_label = {}
-    for idx in data_df.index:
-        row = data_df.loc[idx]
-        inst_key = row.get('instrument_key')
-        if inst_key is None or pd.isna(inst_key):
-            continue
-        label = f"{row['Symbol']} {row['StrikePrice']:.0f}"
-        leg_keys_by_label[label] = str(inst_key)
+    working = data_df.copy()
+    working['inst_key_str'] = working['instrument_key'].apply(
+        lambda k: str(k) if (k is not None and not pd.isna(k)) else None
+    )
+    working = working.dropna(subset=['inst_key_str'])
+    working['Pin'] = working['inst_key_str'].isin(section_pinned)
 
-    label_by_key = {v: k for k, v in leg_keys_by_label.items()}
-    default_labels = [label_by_key[k] for k in leg_keys_by_label.values() if k in section_pinned]
+    # Pinned rows bubble to the top; everyone else stays sorted by change %.
+    working = working.sort_values(by=['Pin', 'change %'], ascending=[False, False])
+    working = working.set_index('inst_key_str')
 
-    chosen_labels = st.multiselect(
-        "📌 Pin to top",
-        options=list(leg_keys_by_label.keys()),
-        default=default_labels,
-        key=f"{key_suffix}_{leg_label}_pin_select",
+    view_cols = ['Pin', 'Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
+
+    edited = st.data_editor(
+        working[view_cols],
+        hide_index=True,
+        width='stretch',
+        height=1800,
+        key=f"{key_suffix}_{leg_label}_pin_editor",
+        column_config={
+            'Pin': st.column_config.CheckboxColumn('📌', help='Click to pin/unpin — pinned rows stay at the top', width='small'),
+            'Symbol': st.column_config.TextColumn('Symbol'),
+            'StrikePrice': st.column_config.NumberColumn('StrikePrice', format='%.2f'),
+            'ltp': st.column_config.NumberColumn('ltp', format='%.2f'),
+            'Trigger': st.column_config.NumberColumn('Trigger', format='%.2f'),
+            'change %': st.column_config.ProgressColumn('change %', format='%.2f%%', min_value=0, max_value=150),
+            'TGT': st.column_config.NumberColumn('TGT', format='%.2f'),
+            'SL': st.column_config.NumberColumn('SL', format='%.2f'),
+            'Triggered On': st.column_config.TextColumn('Triggered On'),
+        },
+        disabled=['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On'],
     )
 
-    chosen_keys = {leg_keys_by_label[l] for l in chosen_labels if l in leg_keys_by_label}
-    prior_leg_keys = {k for k in leg_keys_by_label.values() if k in section_pinned}
-
-    if chosen_keys != prior_leg_keys:
-        updated_section = (section_pinned - set(leg_keys_by_label.values())) | chosen_keys
-        all_pinned[key_suffix] = updated_section
+    new_pinned = set(edited.index[edited['Pin']].tolist())
+    if new_pinned != section_pinned:
+        all_pinned[key_suffix] = new_pinned
         save_pinned_stocks(all_pinned)
-
-    return chosen_keys
 
 
 def render_add_to_log_selector(data_df, key_suffix, leg_label):
@@ -1244,79 +1189,16 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
-    display_cols = ['★', 'Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
-
-    def color_change(val):
-        # Fixed two-tier coloring (no graduated/ascending scale):
-        # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
-        if not isinstance(val, (int, float)):
-            return ''
-        if val >= 100:
-            return 'background-color: darkgreen; color: white; font-weight: 700'
-        elif val >= 90:
-            return 'background-color: lightgreen; color: black; font-weight: 700'
-        return ''
-
-    def color_pin(val):
-        if val == '★':
-            return 'color: #f59e0b; font-weight: 700'
-        return 'color: #cbd5e1'
-
-    format_dict = {
-        'change %': '{:.2f}%',
-        'Trigger': '{:.2f}',
-        'TGT': '{:.2f}',
-        'SL': '{:.2f}',
-        'ltp': '{:.2f}',
-        'StrikePrice': '{:.2f}'
-    }
-
-    def render_table(data_df):
-        return (
-            data_df[display_cols].style
-            .map(color_change, subset=['change %'])
-            .map(color_pin, subset=['★'])
-            .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
-            .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
-            .format(format_dict)
-            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
-        )
-
-    def apply_pins(data_df, pinned_keys):
-        # Adds the ★/☆ indicator column and bubbles pinned rows to the top,
-        # with everyone else still sorted by change % as usual underneath.
-        data_df = data_df.copy()
-        data_df['★'] = data_df['instrument_key'].apply(
-            lambda k: '★' if (k is not None and not pd.isna(k) and str(k) in pinned_keys) else '☆'
-        )
-        data_df['_is_pinned'] = (data_df['★'] == '★')
-        data_df = data_df.sort_values(by=['_is_pinned', 'change %'], ascending=[False, False])
-        return data_df
-
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
-        ce_pinned = render_pin_selector(calls_df, key_suffix, "CE")
-        calls_df = apply_pins(calls_df, ce_pinned)
         render_add_to_log_selector(calls_df, key_suffix, "CE")
-        st.dataframe(
-            render_table(calls_df),
-            hide_index=True,
-            width='stretch',
-            height=1800,
-        )
+        render_pinnable_table(calls_df, key_suffix, "CE")
 
     with col2:
         st.subheader("Lower Strike (PE)")
-        pe_pinned = render_pin_selector(puts_df, key_suffix, "PE")
-        puts_df = apply_pins(puts_df, pe_pinned)
         render_add_to_log_selector(puts_df, key_suffix, "PE")
-        st.dataframe(
-            render_table(puts_df),
-            hide_index=True,
-            width='stretch',
-            height=1800,
-        )
+        render_pinnable_table(puts_df, key_suffix, "PE")
 
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
@@ -1359,17 +1241,17 @@ else:
             "Enable Trigger Alerts",
             value=st.session_state.get('telegram_enabled', False),
             key='telegram_enabled',
-            help="Sends tiered Telegram messages as an option's change % (LTP vs Trigger) climbs: Approaching (75%) → Near Trigger (threshold below) → Trigger Hit (100%), plus an independent SL Hit alert. Alerts only start firing from 09:30 AM IST onward."
+            help="Sends a Telegram message once an option's change % (LTP vs Trigger) reaches the threshold below. Alerts only start firing from 09:30 AM IST onward."
         )
 
         alert_threshold_pct = st.number_input(
-            "Near Trigger Threshold (%)",
+            "Alert Threshold (%)",
             min_value=1.0,
             max_value=300.0,
             value=st.session_state.get('alert_threshold_pct', 85.0),
             step=1.0,
             key='alert_threshold_pct',
-            help="The 'Near Trigger' tier fires once change % reaches this value (default 85). Approaching fires earlier at 75%, Trigger Hit fires at 100%, and SL Hit fires independently whenever LTP falls to/below SL."
+            help="Telegram alert fires once change % reaches this value (default 85, i.e. before the full 100% Trigger cross)."
         )
 
         st.caption("🕤 Alerts are silent before 09:30 AM IST, then active for the rest of the day.")
