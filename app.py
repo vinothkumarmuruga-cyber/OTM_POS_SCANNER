@@ -456,11 +456,13 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     if not newly_triggered:
         return
 
+    trigger_time_label = ist_now.strftime('%d-%b-%Y %H:%M:%S')
+    header = f"🚀 <b>{threshold_pct:.0f}% Hit — {key_suffix}</b> · {trigger_time_label} IST"
     option_lines = [
         f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} | LTP {row['ltp']:.2f} | Trig {row['Trigger']:.2f}"
         for row in newly_triggered
     ]
-    message = "\n".join(option_lines)
+    message = header + "\n" + "\n".join(option_lines)
     success, error = send_telegram_alert(bot_token, chat_id, message)
 
     if success:
@@ -798,72 +800,60 @@ def compute_and_render_movers(df, key_suffix):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def render_pinnable_table(data_df, key_suffix, leg_label):
+def render_pin_selector(data_df, key_suffix, leg_label):
     """
-    Renders the CE/PE table with a directly clickable 📌 Pin checkbox
-    column (st.data_editor) - click it and that row is pinned/unpinned
-    immediately, no separate picker. Persisted to disk per section
-    (Monthly/Weekly), so pins survive refreshes/reruns and don't reset
-    daily. Pinned rows sort to the top; everyone else stays sorted by
-    change % underneath, same as before.
+    A multiselect ABOVE the table for pinning specific options to the top
+    - not a clickable star INSIDE the table. The table itself is a colored
+    pandas Styler (change % tiers, TGT/SL highlighting), which can't host a
+    real interactive per-row control without losing that styling, and an
+    in-table click is easy to miss while the table keeps auto-refreshing
+    (the same reason "tick to log" was replaced earlier). A ★ column in
+    the table still shows which rows are pinned - it's just not what you
+    click.
 
-    Trade-off (a real Streamlit limitation, chosen deliberately): a truly
-    clickable in-table checkbox requires st.data_editor, which can't
-    render a pandas Styler - so this table no longer has the colored
-    change % tiers / TGT-blue / SL-red backgrounds the old Styler-based
-    table had. change % keeps a progress-bar visual instead, which still
-    conveys magnitude at a glance.
+    Persisted to disk per section (Monthly/Weekly), so pins survive
+    refreshes/reruns and don't reset daily.
 
-    Uses instrument_key as the table's row INDEX (not the default
-    positional index) so Streamlit correctly tracks which row got edited
-    even though row order/content changes on every refresh - editing by
-    position alone is exactly what made the old row-tick-to-log feature
-    unreliable.
+    Returns the current set of pinned instrument_keys (as strings) for
+    THIS leg (CE or PE).
     """
     if data_df.empty:
-        st.info("No rows to display.")
-        return
+        return set()
 
     all_pinned = load_pinned_stocks()
     section_pinned = all_pinned.get(key_suffix, set())
 
-    working = data_df.copy()
-    working['inst_key_str'] = working['instrument_key'].apply(
-        lambda k: str(k) if (k is not None and not pd.isna(k)) else None
-    )
-    working = working.dropna(subset=['inst_key_str'])
-    working['Pin'] = working['inst_key_str'].isin(section_pinned)
+    # Only instrument_keys that actually exist in THIS leg's own data -
+    # keeps CE and PE (which share the same key_suffix bucket) from
+    # stepping on each other when we write back below.
+    leg_keys_by_label = {}
+    for idx in data_df.index:
+        row = data_df.loc[idx]
+        inst_key = row.get('instrument_key')
+        if inst_key is None or pd.isna(inst_key):
+            continue
+        label = f"{row['Symbol']} {row['StrikePrice']:.0f}"
+        leg_keys_by_label[label] = str(inst_key)
 
-    # Pinned rows bubble to the top; everyone else stays sorted by change %.
-    working = working.sort_values(by=['Pin', 'change %'], ascending=[False, False])
-    working = working.set_index('inst_key_str')
+    label_by_key = {v: k for k, v in leg_keys_by_label.items()}
+    default_labels = [label_by_key[k] for k in leg_keys_by_label.values() if k in section_pinned]
 
-    view_cols = ['Pin', 'Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
-
-    edited = st.data_editor(
-        working[view_cols],
-        hide_index=True,
-        width='stretch',
-        height=1800,
-        key=f"{key_suffix}_{leg_label}_pin_editor",
-        column_config={
-            'Pin': st.column_config.CheckboxColumn('📌', help='Click to pin/unpin — pinned rows stay at the top', width='small'),
-            'Symbol': st.column_config.TextColumn('Symbol'),
-            'StrikePrice': st.column_config.NumberColumn('StrikePrice', format='%.2f'),
-            'ltp': st.column_config.NumberColumn('ltp', format='%.2f'),
-            'Trigger': st.column_config.NumberColumn('Trigger', format='%.2f'),
-            'change %': st.column_config.ProgressColumn('change %', format='%.2f%%', min_value=0, max_value=150),
-            'TGT': st.column_config.NumberColumn('TGT', format='%.2f'),
-            'SL': st.column_config.NumberColumn('SL', format='%.2f'),
-            'Triggered On': st.column_config.TextColumn('Triggered On'),
-        },
-        disabled=['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On'],
+    chosen_labels = st.multiselect(
+        "📌 Pin to top",
+        options=list(leg_keys_by_label.keys()),
+        default=default_labels,
+        key=f"{key_suffix}_{leg_label}_pin_select",
     )
 
-    new_pinned = set(edited.index[edited['Pin']].tolist())
-    if new_pinned != section_pinned:
-        all_pinned[key_suffix] = new_pinned
+    chosen_keys = {leg_keys_by_label[l] for l in chosen_labels if l in leg_keys_by_label}
+    prior_leg_keys = {k for k in leg_keys_by_label.values() if k in section_pinned}
+
+    if chosen_keys != prior_leg_keys:
+        updated_section = (section_pinned - set(leg_keys_by_label.values())) | chosen_keys
+        all_pinned[key_suffix] = updated_section
         save_pinned_stocks(all_pinned)
+
+    return chosen_keys
 
 
 def render_add_to_log_selector(data_df, key_suffix, leg_label):
@@ -1189,16 +1179,79 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
 
+    display_cols = ['★', 'Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL', 'Triggered On']
+
+    def color_change(val):
+        # Fixed two-tier coloring (no graduated/ascending scale):
+        # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
+        if not isinstance(val, (int, float)):
+            return ''
+        if val >= 100:
+            return 'background-color: darkgreen; color: white; font-weight: 700'
+        elif val >= 90:
+            return 'background-color: lightgreen; color: black; font-weight: 700'
+        return ''
+
+    def color_pin(val):
+        if val == '★':
+            return 'color: #f59e0b; font-weight: 700'
+        return 'color: #cbd5e1'
+
+    format_dict = {
+        'change %': '{:.2f}%',
+        'Trigger': '{:.2f}',
+        'TGT': '{:.2f}',
+        'SL': '{:.2f}',
+        'ltp': '{:.2f}',
+        'StrikePrice': '{:.2f}'
+    }
+
+    def render_table(data_df):
+        return (
+            data_df[display_cols].style
+            .map(color_change, subset=['change %'])
+            .map(color_pin, subset=['★'])
+            .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
+            .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
+            .format(format_dict)
+            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
+        )
+
+    def apply_pins(data_df, pinned_keys):
+        # Adds the ★/☆ indicator column and bubbles pinned rows to the top,
+        # with everyone else still sorted by change % as usual underneath.
+        data_df = data_df.copy()
+        data_df['★'] = data_df['instrument_key'].apply(
+            lambda k: '★' if (k is not None and not pd.isna(k) and str(k) in pinned_keys) else '☆'
+        )
+        data_df['_is_pinned'] = (data_df['★'] == '★')
+        data_df = data_df.sort_values(by=['_is_pinned', 'change %'], ascending=[False, False])
+        return data_df
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Upper Strike (CE)")
+        ce_pinned = render_pin_selector(calls_df, key_suffix, "CE")
+        calls_df = apply_pins(calls_df, ce_pinned)
         render_add_to_log_selector(calls_df, key_suffix, "CE")
-        render_pinnable_table(calls_df, key_suffix, "CE")
+        st.dataframe(
+            render_table(calls_df),
+            hide_index=True,
+            width='stretch',
+            height=1800,
+        )
 
     with col2:
         st.subheader("Lower Strike (PE)")
+        pe_pinned = render_pin_selector(puts_df, key_suffix, "PE")
+        puts_df = apply_pins(puts_df, pe_pinned)
         render_add_to_log_selector(puts_df, key_suffix, "PE")
-        render_pinnable_table(puts_df, key_suffix, "PE")
+        st.dataframe(
+            render_table(puts_df),
+            hide_index=True,
+            width='stretch',
+            height=1800,
+        )
 
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
