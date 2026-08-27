@@ -106,7 +106,6 @@ META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
-TRADE_LOG_FILE = os.path.join(DATA_DIR, 'trade_log.json')
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
@@ -257,39 +256,6 @@ def clear_trigger_times_for_section(key_suffix):
     remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
     if len(remaining) != len(times):
         save_trigger_time_state(remaining)
-# ============================================================
-# TRADE LOG
-#
-# A small persisted list of trades the user has explicitly logged
-# from the scanner (via the "Add to Log" control under each table).
-# Kept separate from the live scan so the scan itself never has to
-# scroll — this is just the handful of positions actually taken.
-# ============================================================
-def load_trade_log():
-    if os.path.exists(TRADE_LOG_FILE):
-        try:
-            with open(TRADE_LOG_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return []
-def save_trade_log(trades):
-    try:
-        with open(TRADE_LOG_FILE, 'w') as f:
-            json.dump(trades, f)
-    except:
-        pass
-def add_trade(trade):
-    trades = load_trade_log()
-    trade = dict(trade)
-    trade['id'] = f"{trade.get('instrument_key')}_{get_ist_now().strftime('%Y%m%d%H%M%S%f')}"
-    trades.append(trade)
-    save_trade_log(trades)
-    return trade['id']
-def remove_trade(trade_id):
-    trades = load_trade_log()
-    trades = [t for t in trades if t.get('id') != trade_id]
-    save_trade_log(trades)
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -659,209 +625,6 @@ def compute_and_render_movers(df, key_suffix):
     html.append('</div>')
     html.append('</div>')
     st.markdown("".join(html), unsafe_allow_html=True)
-def render_add_to_log_selector(data_df, key_suffix, leg_label):
-    """
-    A stock-picker (selectbox) + "Add" button placed ABOVE the CE/PE table,
-    used to log an option to the Trade Log. Replaces the old row-tick /
-    checkbox selection, which was easy to mis-click while the table keeps
-    auto-refreshing under the user's cursor.
-    """
-    if data_df.empty:
-        st.caption("No rows available.")
-        return
-    options = list(data_df.index)
-    def _fmt(idx):
-        row = data_df.loc[idx]
-        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
-    sel_col, btn_col = st.columns([4, 1])
-    with sel_col:
-        chosen_idx = st.selectbox(
-            "Add to Trade Log",
-            options=options,
-            format_func=_fmt,
-            key=f"{key_suffix}_{leg_label}_add_select",
-            label_visibility="collapsed"
-        )
-    with btn_col:
-        add_clicked = st.button("➕ Add to Log", key=f"{key_suffix}_{leg_label}_add_btn", width='stretch')
-    if add_clicked and chosen_idx is not None:
-        row = data_df.loc[chosen_idx]
-        inst_key = row.get('instrument_key')
-        if not inst_key or pd.isna(inst_key):
-            st.toast("Cannot log — missing instrument key.", icon="⚠️")
-            return
-        add_trade({
-            'key_suffix': key_suffix,
-            'Symbol': row['Symbol'],
-            'OptionType': row['OptionType'],
-            'StrikePrice': float(row['StrikePrice']),
-            'EntryPrice': float(row['ltp']),
-            'EntryTime': get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-            'Trigger': float(row['Trigger']),
-            'TGT': float(row['TGT']),
-            'SL': float(row['SL']),
-            'instrument_key': inst_key,
-        })
-        st.toast(f"Logged to Trade Log: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="✅")
-        # Plain st.rerun() from inside a fragment triggers a full-app rerun
-        # (not just this fragment) - needed so the Trade Log tab's own
-        # fragment picks up the new entry immediately instead of waiting
-        # for its next auto-refresh tick.
-        st.rerun()
-def _update_trade_freeze_state(trade, current_ltp):
-    """
-    The moment an option's LTP first touches TGT or SL, the trade freezes
-    permanently for the rest of the day: Status/CurrentLTP/P&L lock at that
-    price right then and are never recalculated again, no matter what price
-    does afterwards. A trade that is already frozen is a no-op here — later
-    hits don't matter, the first one is final.
-    Mutates `trade` in place (sets 'frozen', 'frozen_status', 'frozen_ltp',
-    'frozen_time'). Returns True if `trade` was changed (so the caller
-    knows to persist it back to disk).
-    """
-    if trade.get('frozen'):
-        return False
-    try:
-        tgt = float(trade.get('TGT'))
-        sl = float(trade.get('SL'))
-    except (TypeError, ValueError):
-        return False
-    if current_ltp >= tgt:
-        hit_status = 'TGT HIT'
-    elif current_ltp <= sl:
-        hit_status = 'SL HIT'
-    else:
-        return False
-    trade['frozen'] = True
-    trade['frozen_status'] = hit_status
-    trade['frozen_ltp'] = current_ltp
-    trade['frozen_time'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
-    return True
-def render_trade_log_tab(access_token):
-    header_col1, header_col2 = st.columns([5, 1])
-    with header_col1:
-        st.header("Trade Log")
-        st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-    trades = load_trade_log()
-    with header_col2:
-        st.write("")  # vertical spacer to align the button with the header
-        if st.button("🧹 Clear All", key="clear_all_trades_btn", width='stretch', disabled=not trades):
-            save_trade_log([])
-            st.toast("Trade Log cleared.", icon="🧹")
-            st.rerun()
-    if not trades:
-        st.info("No trades logged yet. Use the 'Add to Trade Log' picker above the Monthly / Weekly CE/PE tables to log one here.")
-        return
-    st.caption("🔒 The moment TGT or SL is hit, that trade's Status/LTP/P&L freeze for the rest of the day and never change again.")
-    # Normalize legacy/partial trade dicts so every row has the same set of
-    # freeze-related keys with real values (False/None), never a missing
-    # key. This matters because pandas fills a missing dict key with NaN
-    # when building the DataFrame below, and NaN is TRUTHY in Python -
-    # "if row.get('frozen'):" was treating un-frozen rows as frozen too,
-    # which is why CurrentLTP/P&L/Status were showing up blank as "None".
-    for t in trades:
-        t.setdefault('frozen', False)
-        t.setdefault('frozen_status', None)
-        t.setdefault('frozen_ltp', None)
-        t.setdefault('frozen_time', None)
-    # Live LTP for every logged instrument
-    ltp_cache = load_ltp_cache()
-    inst_keys = [t.get('instrument_key') for t in trades if t.get('instrument_key')]
-    inst_keys = list(dict.fromkeys(inst_keys))  # dedupe, keep order
-    if access_token and inst_keys:
-        missing = [k for k in inst_keys if k not in ltp_cache]
-        if missing:
-            fetched = fetch_ltp(missing, access_token)
-            if fetched:
-                save_ltp_cache(fetched)
-                ltp_cache = load_ltp_cache()
-    def _live_ltp(inst_key, entry_price):
-        val = ltp_cache.get(inst_key)
-        try:
-            val = float(val)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-        return float(entry_price)
-    # --- TGT/SL hit freeze (freezes instantly on the first hit) ---
-    any_changed = False
-    for t in trades:
-        live_ltp = _live_ltp(t.get('instrument_key'), t.get('EntryPrice'))
-        if _update_trade_freeze_state(t, live_ltp):
-            any_changed = True
-    if any_changed:
-        save_trade_log(trades)
-    trades_df = pd.DataFrame(trades)
-    def _row_current_ltp(row):
-        if row.get('frozen'):
-            return float(row.get('frozen_ltp', row['EntryPrice']))
-        return _live_ltp(row.get('instrument_key'), row['EntryPrice'])
-    trades_df['CurrentLTP'] = trades_df.apply(_row_current_ltp, axis=1)
-    trades_df['P&L'] = trades_df['CurrentLTP'] - trades_df['EntryPrice']
-    safe_entry = trades_df['EntryPrice'].replace(0, pd.NA)
-    trades_df['P&L %'] = (trades_df['P&L'] / safe_entry) * 100
-    trades_df['P&L %'] = trades_df['P&L %'].fillna(0.0)
-    def _status_label(row):
-        if row.get('frozen'):
-            return row.get('frozen_status', 'CLOSED')
-        return 'OPEN'
-    trades_df['Status'] = trades_df.apply(_status_label, axis=1)
-    # When TGT/SL actually froze the trade — so a "TGT HIT"/"SL HIT" row
-    # never leaves you guessing whether that happened today or was left
-    # over from an earlier day the log wasn't cleared.
-    def _triggered_on(row):
-        if row.get('frozen'):
-            return row.get('frozen_time') or '—'
-        return '—'
-    trades_df['Triggered On'] = trades_df.apply(_triggered_on, axis=1)
-    display_cols = ['key_suffix', 'Symbol', 'OptionType', 'StrikePrice', 'EntryPrice',
-                     'EntryTime', 'CurrentLTP', 'P&L', 'P&L %', 'Status', 'Triggered On']
-    def color_pnl(val):
-        if not isinstance(val, (int, float)):
-            return ''
-        if val > 0:
-            return 'color: #16a34a; font-weight: 700'
-        elif val < 0:
-            return 'color: #dc2626; font-weight: 700'
-        return ''
-    def color_status(val):
-        if val == 'TGT HIT':
-            return 'background-color: #bbf7d0; color: #15803d; font-weight: 700'
-        if val == 'SL HIT':
-            return 'background-color: #fecaca; color: #b91c1c; font-weight: 700'
-        return 'background-color: #dbeafe; color: #1d4ed8; font-weight: 700'
-    styled = (
-        trades_df[display_cols].style
-        .map(color_pnl, subset=['P&L', 'P&L %'])
-        .map(color_status, subset=['Status'])
-        .format({
-            'StrikePrice': '{:.2f}', 'EntryPrice': '{:.2f}', 'CurrentLTP': '{:.2f}',
-            'P&L': '{:.2f}', 'P&L %': '{:.2f}%'
-        })
-        .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '15px'})
-    )
-    st.dataframe(styled, hide_index=True, width='stretch')
-    st.markdown("---")
-    st.subheader("Remove a Trade")
-    remove_col_a, remove_col_b = st.columns([3, 1])
-    with remove_col_a:
-        remove_choice = st.selectbox(
-            "Select a trade to remove",
-            options=[t['id'] for t in trades],
-            format_func=lambda tid: next(
-                (f"{t['key_suffix']} — {t['Symbol']} {t['StrikePrice']:.0f} {t['OptionType']} (logged {t['EntryTime']})"
-                 for t in trades if t['id'] == tid),
-                tid
-            ),
-            key="remove_trade_select",
-            label_visibility="collapsed"
-        )
-    with remove_col_b:
-        if st.button("🗑️ Remove", key="remove_trade_btn", width='stretch'):
-            remove_trade(remove_choice)
-            st.toast("Trade removed from log.", icon="🗑️")
-            st.rerun()
 def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
@@ -960,7 +723,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col1:
         st.subheader("Upper Strike (CE)")
         calls_df = calls_df.sort_values(by='change %', ascending=False)
-        render_add_to_log_selector(calls_df, key_suffix, "CE")
         st.dataframe(
             render_table(calls_df),
             hide_index=True,
@@ -970,7 +732,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col2:
         st.subheader("Lower Strike (PE)")
         puts_df = puts_df.sort_values(by='change %', ascending=False)
-        render_add_to_log_selector(puts_df, key_suffix, "PE")
         st.dataframe(
             render_table(puts_df),
             hide_index=True,
@@ -1126,8 +887,7 @@ else:
                 # st.file_uploader keeps returning the SAME UploadedFile on
                 # every single rerun for as long as it sits in the widget -
                 # not just on the rerun where it was chosen. Several actions
-                # elsewhere in this app (adding/removing a trade, clearing
-                # the log, etc.) trigger a full-page st.rerun(), and without
+                # elsewhere in this app trigger a full-page st.rerun(), and without
                 # this guard every one of those reruns would re-detect the
                 # expiry from the SAME original filename and stomp any
                 # manual correction made afterwards in "Confirm Expiry
@@ -1211,7 +971,7 @@ def get_target_expiry(meta_expiry_key):
             return None
     return None
 if not nse_json_df.empty:
-    tab_monthly, tab_weekly, tab_tradelog = st.tabs(["📅 Monthly", "🗓️ Weekly", "📒 Trade Log"])
+    tab_monthly, tab_weekly = st.tabs(["📅 Monthly", "🗓️ Weekly"])
     with tab_monthly:
         st.header("Monthly Options")
         target_expiry_m = get_target_expiry('MonthlyIVExpiry')
@@ -1238,11 +998,5 @@ if not nse_json_df.empty:
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
-    with tab_tradelog:
-        run_every = refresh_interval if auto_refresh else None
-        @st.fragment(run_every=run_every)
-        def show_trade_log():
-            render_trade_log_tab(access_token)
-        show_trade_log()
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
