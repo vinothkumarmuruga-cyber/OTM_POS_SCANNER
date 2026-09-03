@@ -58,43 +58,6 @@ st.markdown("""
         div[data-testid="stDataFrame"] {
             font-weight: 600 !important;
         }
-        /* Movers panel ("what changed since last refresh") */
-        .movers-panel {
-            border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; margin-bottom: 14px;
-        }
-        .movers-head {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 8px 14px; background: #f8fafc; border-bottom: 1px solid #e5e7eb;
-            font-size: 12.5px; font-weight: 700; color: #334155;
-        }
-        .movers-empty {
-            padding: 10px 14px; font-size: 13px; color: #94a3b8;
-        }
-        .movers-row {
-            display: flex; align-items: center; gap: 10px; padding: 8px 14px;
-            border-bottom: 1px solid #f1f5f9; font-size: 13px;
-        }
-        .movers-row:last-child { border-bottom: none; }
-        .movers-arrow-up, .movers-arrow-down {
-            width: 22px; height: 22px; border-radius: 6px; display: flex;
-            align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700; font-size: 13px;
-        }
-        .movers-arrow-up { background: #dcfce7; color: #16a34a; }
-        .movers-arrow-down { background: #fee2e2; color: #dc2626; }
-        .movers-sym { font-weight: 700; color: #0f172a; width: 150px; flex-shrink: 0; }
-        .movers-detail { color: #475569; flex: 1; }
-        .movers-delta-up { color: #16a34a; font-weight: 700; }
-        .movers-delta-down { color: #dc2626; font-weight: 700; }
-        /* Movers panel split into CE / PE columns */
-        .movers-body { display: flex; }
-        .movers-side { flex: 1; min-width: 0; }
-        .movers-side:first-child { border-right: 1px solid #e5e7eb; }
-        .movers-side-head {
-            padding: 6px 14px; font-size: 11px; font-weight: 700; color: #64748b;
-            background: #fafbfc; border-bottom: 1px solid #f1f5f9; letter-spacing: 0.03em;
-        }
-        .movers-side .movers-row { padding: 8px 10px; }
-        .movers-side .movers-sym { width: auto; margin-right: 4px; }
     </style>
 """, unsafe_allow_html=True)
 # Paths for persistent storage
@@ -597,94 +560,6 @@ def attach_trigger_times(df, key_suffix, expiry_date):
     df = df.copy()
     df['Triggered On'] = labels
     return df
-# Minimum move (in change % percentage points) for a row to be shown in
-# the "What Changed Since Last Refresh" movers panel — keeps the panel to
-# genuine movers instead of every tiny tick.
-MOVERS_MIN_DELTA = 1.0
-MOVERS_MAX_ROWS = 8
-# Movers panel only shows options whose CURRENT change % (LTP vs Trigger)
-# is within this band — too far below 75% isn't worth watching yet, and
-# above 125% is already well past Trigger.
-MOVERS_MIN_PCT = 75.0
-MOVERS_MAX_PCT = 125.0
-def compute_and_render_movers(df, key_suffix):
-    """
-    Compares the current change % for each instrument against the snapshot
-    taken on the previous refresh (stored in st.session_state, so it works
-    whether the "previous refresh" was an auto-refresh fragment rerun or a
-    plain manual rerun). Only shows rows that moved UP by >= MOVERS_MIN_DELTA
-    percentage points AND whose current change % is between MOVERS_MIN_PCT
-    and MOVERS_MAX_PCT, split into separate CE / PE columns, biggest movers
-    first.
-    """
-    snapshot_key = f'movers_prev_{key_suffix}'
-    snapshot_time_key = f'movers_prev_time_{key_suffix}'
-    prev_snapshot = st.session_state.get(snapshot_key, {})
-    prev_time = st.session_state.get(snapshot_time_key)
-    current_snapshot = {}
-    ce_movers = []
-    pe_movers = []
-    for _, row in df.iterrows():
-        inst_key = row.get('instrument_key')
-        if not inst_key or pd.isna(inst_key):
-            continue
-        try:
-            cur_change = float(row['change %'])
-        except:
-            continue
-        current_snapshot[inst_key] = cur_change
-        if inst_key in prev_snapshot:
-            delta = cur_change - prev_snapshot[inst_key]
-            # Only positive (upward) moves, and only within the 75%-125% band.
-            if delta >= MOVERS_MIN_DELTA and MOVERS_MIN_PCT <= cur_change <= MOVERS_MAX_PCT:
-                mover = {
-                    'Symbol': row['Symbol'],
-                    'StrikePrice': row['StrikePrice'],
-                    'Prev': prev_snapshot[inst_key],
-                    'Now': cur_change,
-                    'Delta': delta,
-                }
-                if row['OptionType'] == 'CE':
-                    ce_movers.append(mover)
-                else:
-                    pe_movers.append(mover)
-    # Save this run's snapshot for the *next* refresh to compare against.
-    st.session_state[snapshot_key] = current_snapshot
-    st.session_state[snapshot_time_key] = get_ist_now()
-    ce_movers.sort(key=lambda m: m['Delta'], reverse=True)
-    pe_movers.sort(key=lambda m: m['Delta'], reverse=True)
-    ce_movers = ce_movers[:MOVERS_MAX_ROWS]
-    pe_movers = pe_movers[:MOVERS_MAX_ROWS]
-    since_label = prev_time.strftime('%H:%M:%S') if prev_time else "—"
-    def render_side(movers, label):
-        side_html = [f'<div class="movers-side"><div class="movers-side-head">{label} &middot; {len(movers)} mover(s)</div>']
-        if prev_time is None:
-            side_html.append('<div class="movers-empty">Collecting baseline…</div>')
-        elif not movers:
-            side_html.append('<div class="movers-empty">No qualifying mover (75%-125% band).</div>')
-        else:
-            for m in movers:
-                side_html.append(
-                    '<div class="movers-row">'
-                    '<div class="movers-arrow-up">▲</div>'
-                    f'<div class="movers-sym">{m["Symbol"]} {m["StrikePrice"]:.0f}</div>'
-                    f'<div class="movers-detail">{m["Prev"]:.2f}% &rarr; {m["Now"]:.2f}%</div>'
-                    f'<div class="movers-delta-up">+{m["Delta"]:.2f}%</div>'
-                    '</div>'
-                )
-        side_html.append('</div>')
-        return "".join(side_html)
-    html = ['<div class="movers-panel">']
-    html.append(
-        f'<div class="movers-head"><span>WHAT CHANGED SINCE LAST REFRESH &middot; {since_label} IST</span>'
-        f'<span>{len(ce_movers)} CE &middot; {len(pe_movers)} PE</span></div>'
-    )
-    html.append('<div class="movers-body">')
-    html.append(render_side(ce_movers, "CE"))
-    html.append(render_side(pe_movers, "PE"))
-    html.append('</div>')
-    html.append('</div>')
-    st.markdown("".join(html), unsafe_allow_html=True)
 def render_add_to_watchlist_selector(data_df, key_suffix, leg_label):
     """
     A stock-picker (selectbox) + "Add" button placed ABOVE the Monthly /
@@ -814,8 +689,8 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             return 0.0
     df['change %'] = df.apply(calculate_numeric_change, axis=1)
     # Drop options whose Trigger price is below ₹3 — too cheap to be a
-    # meaningful/tradeable OTM candidate, so keep them out of the table,
-    # the movers panel, and the Telegram alerts entirely.
+    # meaningful/tradeable OTM candidate, so keep them out of the table
+    # and the Telegram alerts entirely.
     df = df[df['Trigger'] >= 3].copy()
     if df.empty:
         st.info("No rows with Trigger price ≥ ₹3.")
@@ -825,8 +700,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     # Watchlist), so each section's alerts go to its own configured
     # Telegram bot/chat.
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
-    # --- What Changed Since Last Refresh ---
-    compute_and_render_movers(df, key_suffix)
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
     puts_df = df[df['OptionType'] == 'PE'].copy()
