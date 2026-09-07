@@ -236,6 +236,23 @@ def clear_trigger_times_for_section(key_suffix):
     remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
     if len(remaining) != len(times):
         save_trigger_time_state(remaining)
+_OLD_TRIGGER_TIME_FORMAT = re.compile(r'^\d{1,2}&\d{1,2}\.\d{2}$')
+def migrate_old_trigger_time_stamps():
+    """
+    One-time cleanup for stamps saved under the old "<day>&<hour>.<minute>"
+    shorthand (e.g. "7&8.15") from before the format changed to
+    "DD-Mon-YYYY HH:MM:SS". That old format didn't record month, year, or
+    AM/PM, so it can't be reliably converted - the only honest fix is to
+    drop those entries so they get freshly re-stamped (in the new format,
+    with today's real date/time) the next time that option is seen at or
+    above 100%. Safe to call every run: does nothing once no old-format
+    stamps remain.
+    """
+    times = load_trigger_time_state()
+    remaining = {k: v for k, v in times.items() if not _OLD_TRIGGER_TIME_FORMAT.match(str(v))}
+    if len(remaining) != len(times):
+        save_trigger_time_state(remaining)
+migrate_old_trigger_time_stamps()
 # ============================================================
 # PEAK CHANGE % (Monthly / Weekly)
 #
