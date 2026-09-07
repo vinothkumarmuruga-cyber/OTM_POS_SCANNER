@@ -143,11 +143,28 @@ def load_token():
         except:
             pass
     return ''
+def load_token_meta():
+    """
+    Like load_token(), but returns the full record (token + when it was
+    saved) instead of just the token string - used to show the "token
+    freshness" caption/warning in the sidebar. Returns None if there's no
+    token saved for today (same day-scoping as load_token).
+    """
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+                if data.get('date') == get_ist_now().strftime('%Y-%m-%d'):
+                    return data
+        except:
+            pass
+    return None
 def save_token(token):
     try:
         data = {
             'date': get_ist_now().strftime('%Y-%m-%d'),
-            'token': token
+            'token': token,
+            'saved_at': get_ist_now().strftime('%H:%M:%S')
         }
         with open(TOKEN_FILE, 'w') as f:
             json.dump(data, f)
@@ -222,16 +239,16 @@ def clear_trigger_times_for_section(key_suffix):
     if len(remaining) != len(times):
         save_trigger_time_state(remaining)
 # ============================================================
-# 100% LIST (Monthly only)
+# 100% LIST (Monthly & Weekly)
 #
-# A persisted, auto-populating list: any Monthly option whose change %
-# (LTP vs Trigger) reaches 100% is permanently captured here the moment it
-# happens - no manual "Add to Watch" click needed. Unlike the Telegram
-# alert-dedup state, this is NOT date-scoped and NOT tied to an expiry -
-# once an option lands here it stays forever, still tracked with live
-# LTP/change%, until the user clicks "Clear 100% List" in that tab. A new
-# Monthly IV Excel upload, a new trading day, an app restart - none of
-# that clears it. Only a manual clear does.
+# A persisted, auto-populating list: any Monthly OR Weekly option whose
+# change % (LTP vs Trigger) reaches 100% is permanently captured here the
+# moment it happens - no manual "Add to Watch" click needed. Unlike the
+# Telegram alert-dedup state, this is NOT date-scoped and NOT tied to an
+# expiry - once an option lands here it stays forever, still tracked with
+# live LTP/change%, until the user clicks "Clear 100% List" (or removes
+# that one row) in that tab. A new IV Excel upload, a new trading day, an
+# app restart - none of that clears it. Only a manual clear/remove does.
 # ============================================================
 def load_hundred_pct_list():
     if os.path.exists(HUNDRED_PCT_FILE):
@@ -249,6 +266,49 @@ def save_hundred_pct_list(items):
         pass
 def clear_hundred_pct_list():
     save_hundred_pct_list([])
+def remove_hundred_pct_item(instrument_key):
+    """
+    Drops a single row off the persisted 100% List by instrument_key,
+    leaving every other entry untouched. Does NOT reset that instrument's
+    cross_state, so - same as a full "Clear" - it won't silently reappear
+    on the next refresh just because it's still sitting at/above 100%;
+    only a genuine dip-below-then-back-above-100% re-adds it.
+    """
+    items = load_hundred_pct_list()
+    items = [it for it in items if str(it.get('instrument_key')) != str(instrument_key)]
+    save_hundred_pct_list(items)
+def render_remove_from_hundred_pct_selector(data_df, leg_label):
+    """
+    A stock-picker (selectbox) + "Remove" button placed ABOVE the 100%
+    List tab's own CE/PE table, used to drop a single option back off the
+    list without clearing everything else.
+    """
+    if data_df.empty:
+        st.caption("Nothing to remove for this leg.")
+        return
+    options = list(data_df.index)
+    def _fmt(idx):
+        row = data_df.loc[idx]
+        src = row.get('Source')
+        tag = f" [{src}]" if isinstance(src, str) and src else ""
+        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}{tag} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
+    sel_col, btn_col = st.columns([4, 1])
+    with sel_col:
+        chosen_idx = st.selectbox(
+            "Remove from 100% List",
+            options=options,
+            format_func=_fmt,
+            key=f"hp_{leg_label}_remove_select",
+            label_visibility="collapsed"
+        )
+    with btn_col:
+        remove_clicked = st.button("🗑️ Remove", key=f"hp_{leg_label}_remove_btn", width='stretch')
+    if remove_clicked and chosen_idx is not None:
+        row = data_df.loc[chosen_idx]
+        inst_key = row.get('instrument_key')
+        remove_hundred_pct_item(inst_key)
+        st.toast(f"Removed from 100% List: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="🗑️")
+        st.rerun()
 def load_hundred_pct_cross_state():
     if os.path.exists(HUNDRED_PCT_STATE_FILE):
         try:
@@ -333,16 +393,83 @@ def process_hundred_pct_list():
     render time; the result has the exact same shape that
     display_option_chain already knows how to render, with live LTP /
     change% computed fresh on every refresh.
+    'source' (Monthly/Weekly, whichever tab first caught the 100% cross)
+    and 'AddedOn' (the moment it was captured) are renamed to 'Source' and
+    'Triggered On' here so display_option_chain shows them exactly like
+    the Monthly/Weekly tables' own Source/Triggered On columns.
     """
-    cols = ['Symbol', 'StrikePrice', 'OptionType', 'instrument_key', 'Trigger', 'TGT', 'SL']
+    cols = ['Symbol', 'StrikePrice', 'OptionType', 'instrument_key', 'Trigger', 'TGT', 'SL', 'source', 'AddedOn']
     items = load_hundred_pct_list()
     if not items:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=['Symbol', 'StrikePrice', 'OptionType', 'instrument_key', 'Trigger', 'TGT', 'SL', 'Source', 'Triggered On'])
     df = pd.DataFrame(items)
     for c in cols:
         if c not in df.columns:
             df[c] = None
-    return df[cols].reset_index(drop=True)
+    df = df[cols].rename(columns={'source': 'Source', 'AddedOn': 'Triggered On'})
+    return df.reset_index(drop=True)
+# ============================================================
+# PEAK CHANGE % (Monthly / Weekly / 100% List)
+#
+# Tracks, per instrument_key, the highest change % (LTP vs Trigger) ever
+# observed for that exact option contract, across whichever tab happened
+# to be open when it was seen - persisted to disk so it survives
+# refreshes/reruns/restarts. Shown as a 'Peak %' column so a pullback
+# (change % currently below 100%) can be judged against how far it
+# actually ran - e.g. currently at 60% but peaked at 145% is a very
+# different setup than one that only ever reached 105%. Never resets on
+# its own; there's no UI to clear it since a resettable peak isn't
+# meaningful (unlike the 100% List, "highest ever" only means something if
+# it truly never goes down).
+# ============================================================
+PEAK_CHANGE_FILE = os.path.join(DATA_DIR, 'peak_change_state.json')
+def load_peak_change_state():
+    if os.path.exists(PEAK_CHANGE_FILE):
+        try:
+            with open(PEAK_CHANGE_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+def save_peak_change_state(state):
+    try:
+        with open(PEAK_CHANGE_FILE, 'w') as f:
+            json.dump(state, f)
+    except:
+        pass
+def attach_peak_change(df):
+    """
+    Adds a 'Peak %' column: for each row, the higher of (a) its current
+    change % and (b) the highest change % ever recorded for that
+    instrument_key. Updates and persists the running max as it goes.
+    """
+    df = df.copy()
+    if df.empty or 'instrument_key' not in df.columns:
+        df['Peak %'] = []
+        return df
+    state = load_peak_change_state()
+    changed = False
+    peaks = []
+    for _, row in df.iterrows():
+        inst_key = row.get('instrument_key')
+        try:
+            change_pct = float(row.get('change %', 0.0))
+        except:
+            change_pct = 0.0
+        if not inst_key or pd.isna(inst_key):
+            peaks.append(change_pct)
+            continue
+        inst_key = str(inst_key)
+        prev_peak = float(state.get(inst_key, 0.0))
+        new_peak = max(prev_peak, change_pct)
+        if new_peak != prev_peak:
+            state[inst_key] = new_peak
+            changed = True
+        peaks.append(new_peak)
+    if changed:
+        save_peak_change_state(state)
+    df['Peak %'] = peaks
+    return df
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -461,13 +588,14 @@ def load_nse_json():
     else:
         st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
-def process_iv_excel(excel_path, df_json, expiry_date):
+def process_iv_excel(excel_path, df_json, expiry_date, trigger_multiplier=2.0):
     """
-    Reads the Monthly IV Excel (from the IV Sheet Generator) and builds the
-    OTM universe this scanner tracks:
+    Reads the Monthly/Weekly IV Excel (from the IV Sheet Generator) and
+    builds the OTM universe this scanner tracks:
         Upper Strike -> CE (Call) side
         Lower Strike -> PE (Put) side
-    Trigger = Close price x 2
+    Trigger = Close price x trigger_multiplier (default 2, configurable in
+              the sidebar's "Trigger Multiplier" input)
     TGT     = Trigger x 2
     SL      = Trigger / 2
     """
@@ -527,8 +655,8 @@ def process_iv_excel(excel_path, df_json, expiry_date):
                 "or update NSE.json."
             )
         combined = merged[['Symbol', 'StrikePrice', 'OptionType', 'Close', 'instrument_key']]
-    # Trigger / Target calculation (User Rule)
-    combined['Trigger'] = combined['Close'] * 2
+    # Trigger / Target calculation (User Rule, multiplier configurable)
+    combined['Trigger'] = combined['Close'] * trigger_multiplier
     combined['TGT'] = combined['Trigger'] * 2
     combined['SL'] = combined['Trigger'] / 2
     return combined.reset_index(drop=True)
@@ -622,7 +750,7 @@ def attach_trigger_times(df, key_suffix, expiry_date):
     df = df.copy()
     df['Triggered On'] = labels
     return df
-def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar."):
+def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar.", show_remove_from_hundred_pct=False):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info(empty_message)
@@ -675,11 +803,21 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     if df.empty:
         st.info("No rows with Trigger price ≥ ₹3.")
         return
-    # --- 100% List auto-capture (Monthly only) ---
-    # The instant a Monthly option's change % reaches 100%, it's
+    # --- Peak % (all tabs) ---
+    # Highest change % ever seen for each instrument, persisted so a
+    # pullback can be judged against how far it actually ran.
+    df = attach_peak_change(df)
+    # --- Triggered On (Monthly / Weekly only) ---
+    # The 100% List already carries its own capture timestamp as
+    # 'Triggered On' (renamed from AddedOn in process_hundred_pct_list),
+    # so this only needs to run for the live Monthly/Weekly tables.
+    if key_suffix in ("Monthly", "Weekly"):
+        df = attach_trigger_times(df, key_suffix, expiry_date)
+    # --- 100% List auto-capture (Monthly & Weekly) ---
+    # The instant a Monthly or Weekly option's change % reaches 100%, it's
     # permanently added to the persisted 100% List tab - independent of
     # Telegram being enabled/configured, and never auto-removed.
-    if key_suffix == "Monthly":
+    if key_suffix in ("Monthly", "Weekly"):
         auto_populate_hundred_pct_list(df, key_suffix)
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
     # bot_token/chat_id passed in are section-specific (Monthly vs Weekly),
@@ -693,8 +831,15 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     # TGT/SL are still computed upstream (process_iv_excel / the 100% List
     # snapshot) but intentionally left out of the displayed table below,
     # across all three tabs (Monthly, Weekly, 100% List) since they all
-    # render through this same function.
-    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %']
+    # render through this same function. 'Source' and 'Triggered On' only
+    # exist on whichever df actually carries them (100% List has both;
+    # Monthly/Weekly have 'Triggered On' only), so they're added to the
+    # displayed columns dynamically rather than assumed.
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'Peak %']
+    if 'Source' in df.columns:
+        display_cols.append('Source')
+    if 'Triggered On' in df.columns:
+        display_cols.append('Triggered On')
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
         # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
@@ -707,6 +852,7 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         return ''
     format_dict = {
         'change %': '{:.2f}%',
+        'Peak %': '{:.2f}%',
         'Trigger': '{:.2f}',
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
@@ -722,6 +868,8 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col1:
         st.subheader("Upper Strike (CE)")
         calls_df = calls_df.sort_values(by='change %', ascending=False)
+        if show_remove_from_hundred_pct:
+            render_remove_from_hundred_pct_selector(calls_df, "CE")
         st.dataframe(
             render_table(calls_df),
             hide_index=True,
@@ -731,12 +879,28 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col2:
         st.subheader("Lower Strike (PE)")
         puts_df = puts_df.sort_values(by='change %', ascending=False)
+        if show_remove_from_hundred_pct:
+            render_remove_from_hundred_pct_selector(puts_df, "PE")
         st.dataframe(
             render_table(puts_df),
             hide_index=True,
             width='stretch',
             height=1800,
         )
+    # --- CSV export (all tabs) ---
+    export_cols = ['Symbol', 'OptionType', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'Peak %']
+    if 'Source' in df.columns:
+        export_cols.append('Source')
+    if 'Triggered On' in df.columns:
+        export_cols.append('Triggered On')
+    export_df = pd.concat([calls_df, puts_df])[export_cols]
+    st.download_button(
+        "⬇️ Download CSV",
+        data=export_df.to_csv(index=False).encode('utf-8'),
+        file_name=f"{key_suffix}_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key=f"{key_suffix}_download_csv",
+    )
 # --- Configuration Logic (Before Sidebar) ---
 # Wrapped in try/except: st.secrets raises if no secrets.toml exists at all
 # (e.g. running locally without one configured) - default to Admin view in that case.
@@ -764,6 +928,7 @@ if is_client_view:
     weekly_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_WEEKLY", st.secrets.get("TELEGRAM_CHAT_ID", ""))
     weekly_telegram_enabled = bool(weekly_telegram_bot_token and weekly_telegram_chat_id)
     weekly_alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT_WEEKLY", st.secrets.get("ALERT_THRESHOLD_PCT", 85.0)))
+    trigger_multiplier = float(st.secrets.get("TRIGGER_MULTIPLIER", 2.0))
 else:
     with st.sidebar:
         st.header("Configuration")
@@ -771,6 +936,29 @@ else:
         access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
         if access_token and access_token != saved_token:
             save_token(access_token)
+        # --- Token freshness banner ---
+        # Tokens are day-scoped (load_token/save_token only ever return a
+        # token saved on today's date), so this just surfaces that state
+        # instead of leaving a silent "why is LTP 0" moment.
+        _token_meta = load_token_meta()
+        if _token_meta and _token_meta.get('token'):
+            st.caption(f"🔑 Token active for today, saved at {_token_meta.get('saved_at', '—')} IST. Upstox tokens expire daily — re-enter tomorrow.")
+        else:
+            st.warning("⚠️ No access token saved for today. LTP will show as 0 until you enter one.")
+        st.markdown("---")
+        st.header("Trigger Settings")
+        _saved_multiplier = load_meta().get('TriggerMultiplier', 2.0)
+        trigger_multiplier = st.number_input(
+            "Trigger Multiplier (Close × N)",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(_saved_multiplier),
+            step=0.1,
+            key='trigger_multiplier_input',
+            help="Trigger = Close price × this value (default 2). Applies to both Monthly and Weekly. TGT stays Trigger×2 and SL stays Trigger/2."
+        )
+        if trigger_multiplier != _saved_multiplier:
+            save_meta('TriggerMultiplier', trigger_multiplier)
         st.markdown("---")
         st.header("Telegram Alerts")
         st.caption("🕤 Alerts are silent before 09:30 AM IST, then active for the rest of the day.")
@@ -984,7 +1172,7 @@ if not nse_json_df.empty:
             run_every = refresh_interval if auto_refresh else None
             @st.fragment(run_every=run_every)
             def show_monthly():
-                df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
+                df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m, trigger_multiplier)
                 display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=monthly_telegram_enabled, telegram_bot_token=monthly_telegram_bot_token, telegram_chat_id=monthly_telegram_chat_id, alert_threshold_pct=monthly_alert_threshold_pct)
             show_monthly()
         else:
@@ -997,7 +1185,7 @@ if not nse_json_df.empty:
             run_every = refresh_interval if auto_refresh else None
             @st.fragment(run_every=run_every)
             def show_weekly():
-                df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
+                df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w, trigger_multiplier)
                 display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=weekly_telegram_enabled, telegram_bot_token=weekly_telegram_bot_token, telegram_chat_id=weekly_telegram_chat_id, alert_threshold_pct=weekly_alert_threshold_pct)
             show_weekly()
         else:
@@ -1006,7 +1194,7 @@ if not nse_json_df.empty:
         header_col1, header_col2 = st.columns([5, 1])
         with header_col1:
             st.header("100% List")
-            st.caption("Fills in automatically from the Monthly tab the moment an option hits 100%. Stays here across refreshes, reruns and new uploads — only 'Clear 100% List' empties it.")
+            st.caption("Fills in automatically from Monthly and Weekly the moment an option hits 100%. Stays here across refreshes, reruns and new uploads — remove a single row, or 'Clear 100% List' to empty it.")
         with header_col2:
             st.write("")  # vertical spacer to align the button with the header
             hp_items = load_hundred_pct_list()
@@ -1022,7 +1210,8 @@ if not nse_json_df.empty:
                 df_hp, access_token, "HundredPct", expiry_date=None,
                 telegram_enabled=False, telegram_bot_token="", telegram_chat_id="",
                 alert_threshold_pct=100,
-                empty_message="No options have hit 100% yet. This fills in automatically from the Monthly tab."
+                empty_message="No options have hit 100% yet. This fills in automatically from Monthly and Weekly.",
+                show_remove_from_hundred_pct=True
             )
         show_hundred_pct()
 else:
