@@ -70,6 +70,7 @@ LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
 HUNDRED_PCT_FILE = os.path.join(DATA_DIR, 'hundred_pct_list.json')
+HUNDRED_PCT_STATE_FILE = os.path.join(DATA_DIR, 'hundred_pct_cross_state.json')
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
@@ -248,48 +249,81 @@ def save_hundred_pct_list(items):
         pass
 def clear_hundred_pct_list():
     save_hundred_pct_list([])
+def load_hundred_pct_cross_state():
+    if os.path.exists(HUNDRED_PCT_STATE_FILE):
+        try:
+            with open(HUNDRED_PCT_STATE_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+def save_hundred_pct_cross_state(state):
+    try:
+        with open(HUNDRED_PCT_STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except:
+        pass
 def auto_populate_hundred_pct_list(df, key_suffix):
     """
     Scans df (already has 'change %' computed) for any option that has
-    reached/crossed 100% (LTP >= Trigger) and, if its instrument_key isn't
-    already on the persisted 100% List, adds it permanently. Dedup is by
-    instrument_key, so this is safe to call on every single refresh/rerun
-    - already-listed instruments are simply skipped, never re-added or
-    removed.
+    reached/crossed 100% (LTP >= Trigger) and, on a FRESH cross above
+    100%, adds it to the persisted 100% List.
+
+    "Fresh cross" is tracked separately from the visible list itself, in
+    hundred_pct_cross_state.json - one bool per instrument, "currently at
+    or above 100%". This is what fixes the "Clear doesn't stay cleared"
+    bug: without it, an option sitting continuously above 100% would get
+    re-detected as ">=100% and not yet in the list" on the very next
+    refresh after you clear it, and silently reappear. With cross-state,
+    clearing the visible list doesn't touch the underlying "is this
+    instrument currently above 100%" flag, so it is NOT re-added until it
+    genuinely dips back below 100% and rallies above it again - a real new
+    occurrence, not a stale one.
+
+    Once an option IS on the list, it is never removed just because its
+    change % dips below 100% (that's the point - pullback trades) - only
+    a manual "Clear 100% List" click empties the visible list.
     """
     if df.empty or 'instrument_key' not in df.columns:
         return
     items = load_hundred_pct_list()
     existing_keys = {str(it.get('instrument_key')) for it in items}
-    added_any = False
+    cross_state = load_hundred_pct_cross_state()
+    list_changed = False
+    state_changed = False
     for _, row in df.iterrows():
         inst_key = row.get('instrument_key')
         if not inst_key or pd.isna(inst_key):
             continue
         inst_key = str(inst_key)
-        if inst_key in existing_keys:
-            continue
         try:
             change_pct = float(row.get('change %', 0.0))
         except:
             continue
-        if change_pct < 100:
-            continue
-        items.append({
-            'source': key_suffix,
-            'Symbol': row['Symbol'],
-            'OptionType': row['OptionType'],
-            'StrikePrice': float(row['StrikePrice']),
-            'Trigger': float(row['Trigger']),
-            'TGT': float(row['TGT']),
-            'SL': float(row['SL']),
-            'instrument_key': inst_key,
-            'AddedOn': get_ist_now().strftime('%d-%b-%Y %H:%M:%S'),
-        })
-        existing_keys.add(inst_key)
-        added_any = True
-    if added_any:
+        state_key = f"{key_suffix}:{inst_key}"
+        was_above = bool(cross_state.get(state_key, False))
+        now_above = change_pct >= 100
+        if now_above != was_above:
+            cross_state[state_key] = now_above
+            state_changed = True
+        if now_above and not was_above and inst_key not in existing_keys:
+            items.append({
+                'source': key_suffix,
+                'Symbol': row['Symbol'],
+                'OptionType': row['OptionType'],
+                'StrikePrice': float(row['StrikePrice']),
+                'Trigger': float(row['Trigger']),
+                'TGT': float(row['TGT']),
+                'SL': float(row['SL']),
+                'instrument_key': inst_key,
+                'AddedOn': get_ist_now().strftime('%d-%b-%Y %H:%M:%S'),
+            })
+            existing_keys.add(inst_key)
+            list_changed = True
+    if list_changed:
         save_hundred_pct_list(items)
+    if state_changed:
+        save_hundred_pct_cross_state(cross_state)
 def process_hundred_pct_list():
     """
     Builds the 100% List's own OTM-style dataframe straight from the
@@ -656,7 +690,11 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     puts_df = df[df['OptionType'] == 'PE'].copy()
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
-    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'TGT', 'SL']
+    # TGT/SL are still computed upstream (process_iv_excel / the 100% List
+    # snapshot) but intentionally left out of the displayed table below,
+    # across all three tabs (Monthly, Weekly, 100% List) since they all
+    # render through this same function.
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %']
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
         # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
@@ -670,8 +708,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     format_dict = {
         'change %': '{:.2f}%',
         'Trigger': '{:.2f}',
-        'TGT': '{:.2f}',
-        'SL': '{:.2f}',
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
     }
@@ -679,8 +715,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         return (
             data_df[display_cols].style
             .map(color_change, subset=['change %'])
-            .set_properties(subset=['TGT'], **{'color': '#1a73e8'})
-            .set_properties(subset=['SL'], **{'background-color': '#fdecea', 'color': '#c0392b'})
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
         )
