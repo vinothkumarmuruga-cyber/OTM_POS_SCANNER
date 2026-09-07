@@ -69,6 +69,7 @@ META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
 TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
+HUNDRED_PCT_FILE = os.path.join(DATA_DIR, 'hundred_pct_list.json')
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
@@ -219,6 +220,95 @@ def clear_trigger_times_for_section(key_suffix):
     remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
     if len(remaining) != len(times):
         save_trigger_time_state(remaining)
+# ============================================================
+# 100% LIST (Monthly only)
+#
+# A persisted, auto-populating list: any Monthly option whose change %
+# (LTP vs Trigger) reaches 100% is permanently captured here the moment it
+# happens - no manual "Add to Watch" click needed. Unlike the Telegram
+# alert-dedup state, this is NOT date-scoped and NOT tied to an expiry -
+# once an option lands here it stays forever, still tracked with live
+# LTP/change%, until the user clicks "Clear 100% List" in that tab. A new
+# Monthly IV Excel upload, a new trading day, an app restart - none of
+# that clears it. Only a manual clear does.
+# ============================================================
+def load_hundred_pct_list():
+    if os.path.exists(HUNDRED_PCT_FILE):
+        try:
+            with open(HUNDRED_PCT_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+def save_hundred_pct_list(items):
+    try:
+        with open(HUNDRED_PCT_FILE, 'w') as f:
+            json.dump(items, f)
+    except:
+        pass
+def clear_hundred_pct_list():
+    save_hundred_pct_list([])
+def auto_populate_hundred_pct_list(df, key_suffix):
+    """
+    Scans df (already has 'change %' computed) for any option that has
+    reached/crossed 100% (LTP >= Trigger) and, if its instrument_key isn't
+    already on the persisted 100% List, adds it permanently. Dedup is by
+    instrument_key, so this is safe to call on every single refresh/rerun
+    - already-listed instruments are simply skipped, never re-added or
+    removed.
+    """
+    if df.empty or 'instrument_key' not in df.columns:
+        return
+    items = load_hundred_pct_list()
+    existing_keys = {str(it.get('instrument_key')) for it in items}
+    added_any = False
+    for _, row in df.iterrows():
+        inst_key = row.get('instrument_key')
+        if not inst_key or pd.isna(inst_key):
+            continue
+        inst_key = str(inst_key)
+        if inst_key in existing_keys:
+            continue
+        try:
+            change_pct = float(row.get('change %', 0.0))
+        except:
+            continue
+        if change_pct < 100:
+            continue
+        items.append({
+            'source': key_suffix,
+            'Symbol': row['Symbol'],
+            'OptionType': row['OptionType'],
+            'StrikePrice': float(row['StrikePrice']),
+            'Trigger': float(row['Trigger']),
+            'TGT': float(row['TGT']),
+            'SL': float(row['SL']),
+            'instrument_key': inst_key,
+            'AddedOn': get_ist_now().strftime('%d-%b-%Y %H:%M:%S'),
+        })
+        existing_keys.add(inst_key)
+        added_any = True
+    if added_any:
+        save_hundred_pct_list(items)
+def process_hundred_pct_list():
+    """
+    Builds the 100% List's own OTM-style dataframe straight from the
+    persisted hundred_pct_list.json. Each entry already carries its
+    resolved instrument_key and its snapshotted Trigger/TGT/SL, so - like
+    the old Watch List - this needs no NSE.json lookup or Excel parse at
+    render time; the result has the exact same shape that
+    display_option_chain already knows how to render, with live LTP /
+    change% computed fresh on every refresh.
+    """
+    cols = ['Symbol', 'StrikePrice', 'OptionType', 'instrument_key', 'Trigger', 'TGT', 'SL']
+    items = load_hundred_pct_list()
+    if not items:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(items)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols].reset_index(drop=True)
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -498,10 +588,10 @@ def attach_trigger_times(df, key_suffix, expiry_date):
     df = df.copy()
     df['Triggered On'] = labels
     return df
-def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85):
+def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar."):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
-        st.info("No data to display. Please upload a valid Monthly IV Excel in the sidebar.")
+        st.info(empty_message)
         return
     # Fetch LTP if token provided
     if access_token:
@@ -551,6 +641,12 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     if df.empty:
         st.info("No rows with Trigger price ≥ ₹3.")
         return
+    # --- 100% List auto-capture (Monthly only) ---
+    # The instant a Monthly option's change % reaches 100%, it's
+    # permanently added to the persisted 100% List tab - independent of
+    # Telegram being enabled/configured, and never auto-removed.
+    if key_suffix == "Monthly":
+        auto_populate_hundred_pct_list(df, key_suffix)
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
     # bot_token/chat_id passed in are section-specific (Monthly vs Weekly),
     # so each section's alerts go to its own configured Telegram bot/chat.
@@ -845,7 +941,7 @@ def get_target_expiry(meta_expiry_key):
             return None
     return None
 if not nse_json_df.empty:
-    tab_monthly, tab_weekly = st.tabs(["📅 Monthly", "🗓️ Weekly"])
+    tab_monthly, tab_weekly, tab_hundred_pct = st.tabs(["📅 Monthly", "🗓️ Weekly", "💯 100% List"])
     with tab_monthly:
         st.header("Monthly Options")
         target_expiry_m = get_target_expiry('MonthlyIVExpiry')
@@ -872,5 +968,28 @@ if not nse_json_df.empty:
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
+    with tab_hundred_pct:
+        header_col1, header_col2 = st.columns([5, 1])
+        with header_col1:
+            st.header("100% List")
+            st.caption("Fills in automatically from the Monthly tab the moment an option hits 100%. Stays here across refreshes, reruns and new uploads — only 'Clear 100% List' empties it.")
+        with header_col2:
+            st.write("")  # vertical spacer to align the button with the header
+            hp_items = load_hundred_pct_list()
+            if st.button("🧹 Clear 100% List", key="clear_hundred_pct_btn", width='stretch', disabled=not hp_items):
+                clear_hundred_pct_list()
+                st.toast("100% List cleared.", icon="🧹")
+                st.rerun()
+        run_every = refresh_interval if auto_refresh else None
+        @st.fragment(run_every=run_every)
+        def show_hundred_pct():
+            df_hp = process_hundred_pct_list()
+            display_option_chain(
+                df_hp, access_token, "HundredPct", expiry_date=None,
+                telegram_enabled=False, telegram_bot_token="", telegram_chat_id="",
+                alert_threshold_pct=100,
+                empty_message="No options have hit 100% yet. This fills in automatically from the Monthly tab."
+            )
+        show_hundred_pct()
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
