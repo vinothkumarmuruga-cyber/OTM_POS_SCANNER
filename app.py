@@ -68,7 +68,6 @@ TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
-TRIGGER_TIME_FILE = os.path.join(DATA_DIR, 'trigger_time_state.json')
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
@@ -195,125 +194,6 @@ def save_trigger_alert_state(keys):
             json.dump(data, f)
     except:
         pass
-# ============================================================
-# TRIGGERED-ON TIMESTAMPS (Monthly/Weekly CE/PE tables)
-#
-# Records the first moment each option's change % actually reaches 100%
-# (LTP reaching the Trigger price itself) so the table can show WHEN it
-# triggered, not just that it currently reads high.
-#
-# NOT date-scoped (unlike the Telegram alert-dedup state above) - this is
-# keyed by key_suffix + expiry date + instrument, so a "Triggered On"
-# stamp holds steady across every refresh AND every day for the entire
-# Monthly / Weekly expiry cycle. It only goes away once you upload a new
-# IV Excel with a different expiry for that section (the old expiry's keys
-# simply stop being looked up).
-# ============================================================
-def load_trigger_time_state():
-    if os.path.exists(TRIGGER_TIME_FILE):
-        try:
-            with open(TRIGGER_TIME_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
-def save_trigger_time_state(times):
-    try:
-        data = times
-        with open(TRIGGER_TIME_FILE, 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
-def clear_trigger_times_for_section(key_suffix):
-    """
-    Wipes every 'Triggered On' stamp recorded for this section (Monthly or
-    Weekly), regardless of expiry. Called the moment a genuinely new IV
-    Excel is uploaded for that section, so there's never any ambiguity
-    about whether a stamp you're looking at is a fresh same-day trigger or
-    a stale leftover from before - a new upload always starts clean.
-    """
-    times = load_trigger_time_state()
-    remaining = {k: v for k, v in times.items() if not k.startswith(f"{key_suffix}:")}
-    if len(remaining) != len(times):
-        save_trigger_time_state(remaining)
-_OLD_TRIGGER_TIME_FORMAT = re.compile(r'^\d{1,2}&\d{1,2}\.\d{2}$')
-def migrate_old_trigger_time_stamps():
-    """
-    One-time cleanup for stamps saved under the old "<day>&<hour>.<minute>"
-    shorthand (e.g. "7&8.15") from before the format changed to
-    "DD-Mon-YYYY HH:MM:SS". That old format didn't record month, year, or
-    AM/PM, so it can't be reliably converted - the only honest fix is to
-    drop those entries so they get freshly re-stamped (in the new format,
-    with today's real date/time) the next time that option is seen at or
-    above 100%. Safe to call every run: does nothing once no old-format
-    stamps remain.
-    """
-    times = load_trigger_time_state()
-    remaining = {k: v for k, v in times.items() if not _OLD_TRIGGER_TIME_FORMAT.match(str(v))}
-    if len(remaining) != len(times):
-        save_trigger_time_state(remaining)
-migrate_old_trigger_time_stamps()
-# ============================================================
-# PEAK CHANGE % (Monthly / Weekly)
-#
-# Tracks, per instrument_key, the highest change % (LTP vs Trigger) ever
-# observed for that exact option contract - persisted to disk so it
-# survives refreshes/reruns/restarts. Shown as a 'Peak %' column so a
-# pullback (change % currently below 100%) can be judged against how far
-# it actually ran - e.g. currently at 60% but peaked at 145% is a very
-# different setup than one that only ever reached 105%. Never resets on
-# its own - there's no UI to clear it, since a resettable peak isn't
-# meaningful ("highest ever" only means something if it truly never goes
-# down).
-# ============================================================
-PEAK_CHANGE_FILE = os.path.join(DATA_DIR, 'peak_change_state.json')
-def load_peak_change_state():
-    if os.path.exists(PEAK_CHANGE_FILE):
-        try:
-            with open(PEAK_CHANGE_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
-def save_peak_change_state(state):
-    try:
-        with open(PEAK_CHANGE_FILE, 'w') as f:
-            json.dump(state, f)
-    except:
-        pass
-def attach_peak_change(df):
-    """
-    Adds a 'Peak %' column: for each row, the higher of (a) its current
-    change % and (b) the highest change % ever recorded for that
-    instrument_key. Updates and persists the running max as it goes.
-    """
-    df = df.copy()
-    if df.empty or 'instrument_key' not in df.columns:
-        df['Peak %'] = []
-        return df
-    state = load_peak_change_state()
-    changed = False
-    peaks = []
-    for _, row in df.iterrows():
-        inst_key = row.get('instrument_key')
-        try:
-            change_pct = float(row.get('change %', 0.0))
-        except:
-            change_pct = 0.0
-        if not inst_key or pd.isna(inst_key):
-            peaks.append(change_pct)
-            continue
-        inst_key = str(inst_key)
-        prev_peak = float(state.get(inst_key, 0.0))
-        new_peak = max(prev_peak, change_pct)
-        if new_peak != prev_peak:
-            state[inst_key] = new_peak
-            changed = True
-        peaks.append(new_peak)
-    if changed:
-        save_peak_change_state(state)
-    df['Peak %'] = peaks
-    return df
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -542,53 +422,6 @@ def fetch_ltp(instrument_keys, token):
             except Exception:
                 pass
     return ltp_map
-# An option counts as "triggered" once its change % (LTP vs Trigger) first
-# reaches this — i.e. LTP has actually reached the Trigger price itself.
-TRIGGERED_AT_PCT = 100.0
-def attach_trigger_times(df, key_suffix, expiry_date):
-    """
-    Stamps a 'Triggered On' column onto df: the date & time the option's
-    change % FIRST reached TRIGGERED_AT_PCT (100%, i.e. LTP actually hit
-    the Trigger price). Once recorded it NEVER changes again — not for the
-    rest of the day, and not on later days either — for as long as this
-    Monthly/Weekly section keeps the same expiry_date. It only resets once
-    you upload a new IV Excel with a different expiry (a new expiry_date
-    means a brand-new set of keys, so the old stamps simply stop applying).
-    Persisted to disk so it survives refreshes/reruns. Blank ('—') until
-    the option actually triggers.
-    Format: "DD-Mon-YYYY HH:MM:SS" 24-hour IST, e.g. "07-Sep-2026 20:15:35"
-    (the moment it FIRST happened, not the current time).
-    """
-    times = load_trigger_time_state()
-    changed = False
-    now_dt = get_ist_now()
-    now_label = now_dt.strftime('%d-%b-%Y %H:%M:%S')
-    expiry_key = expiry_date.strftime('%Y-%m-%d') if expiry_date is not None else 'noexpiry'
-    labels = []
-    for _, row in df.iterrows():
-        inst_key = row.get('instrument_key')
-        if not inst_key or pd.isna(inst_key):
-            labels.append('—')
-            continue
-        key = f"{key_suffix}:{expiry_key}:{inst_key}"
-        if key in times:
-            labels.append(times[key])
-            continue
-        try:
-            change_pct = float(row.get('change %', 0.0))
-        except:
-            change_pct = 0.0
-        if change_pct >= TRIGGERED_AT_PCT:
-            times[key] = now_label
-            changed = True
-            labels.append(now_label)
-        else:
-            labels.append('—')
-    if changed:
-        save_trigger_time_state(times)
-    df = df.copy()
-    df['Triggered On'] = labels
-    return df
 def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar."):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
@@ -642,12 +475,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     if df.empty:
         st.info("No rows with Trigger price ≥ ₹3.")
         return
-    # --- Peak % ---
-    # Highest change % ever seen for each instrument, persisted so a
-    # pullback can be judged against how far it actually ran.
-    df = attach_peak_change(df)
-    # --- Triggered On ---
-    df = attach_trigger_times(df, key_suffix, expiry_date)
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
     # bot_token/chat_id passed in are section-specific (Monthly vs Weekly),
     # so each section's alerts go to its own configured Telegram bot/chat.
@@ -659,7 +486,7 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     puts_df = puts_df.sort_values(by='change %', ascending=False)
     # TGT/SL are still computed upstream but intentionally left out of the
     # displayed table below, on both tabs since they share this function.
-    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'Peak %', 'Triggered On']
+    display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %']
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
         # >=100 -> dark green, 90-99 -> light green, below 90 -> no color.
@@ -670,18 +497,8 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         elif val >= 90:
             return 'background-color: lightgreen; color: black; font-weight: 700'
         return ''
-    def color_peak(val):
-        # Mild blue highlight once an option has ever peaked above 100%
-        # (i.e. it did reach/cross Trigger at some point, even if it has
-        # since pulled back).
-        if not isinstance(val, (int, float)):
-            return ''
-        if val > 100:
-            return 'background-color: #cfe3fb; color: #0b3d91; font-weight: 700'
-        return ''
     format_dict = {
         'change %': '{:.2f}%',
-        'Peak %': '{:.2f}%',
         'Trigger': '{:.2f}',
         'ltp': '{:.2f}',
         'StrikePrice': '{:.2f}'
@@ -690,7 +507,6 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         return (
             data_df[display_cols].style
             .map(color_change, subset=['change %'])
-            .map(color_peak, subset=['Peak %'])
             .format(format_dict)
             .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'})
         )
@@ -714,7 +530,7 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
             height=1800,
         )
     # --- CSV export ---
-    export_cols = ['Symbol', 'OptionType', 'StrikePrice', 'ltp', 'Trigger', 'change %', 'Peak %', 'Triggered On']
+    export_cols = ['Symbol', 'OptionType', 'StrikePrice', 'ltp', 'Trigger', 'change %']
     export_df = pd.concat([calls_df, puts_df])[export_cols]
     st.download_button(
         "⬇️ Download CSV",
@@ -870,10 +686,7 @@ else:
             Renders one Upload + Confirm Expiry block (used for both the
             Monthly IV Excel and the Weekly IV Excel sections below).
             section_key keeps each block's widget keys independent so the
-            two sections never clash with each other. trigger_key_suffix is
-            the "Monthly"/"Weekly" namespace used by attach_trigger_times,
-            so a fresh upload here can wipe that section's Triggered On
-            history.
+            two sections never clash with each other.
             """
             st.subheader(label)
             up_iv = st.file_uploader(
@@ -899,10 +712,6 @@ else:
                     with open(file_path, "wb") as f:
                         f.write(up_iv.getvalue())
                     save_meta(meta_file_key, up_iv.name)
-                    # A genuinely new file for this section always starts
-                    # Triggered On fresh - no ambiguity about whether a
-                    # stamp is a real same-day trigger or a stale leftover.
-                    clear_trigger_times_for_section(trigger_key_suffix)
                     detected_expiry = extract_expiry_from_filename(up_iv.name)
                     if detected_expiry is not None:
                         save_meta(meta_expiry_key, detected_expiry.strftime('%Y-%m-%d'))
