@@ -68,6 +68,7 @@ TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 META_FILE = os.path.join(DATA_DIR, 'meta.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TRIGGER_ALERT_FILE = os.path.join(DATA_DIR, 'trigger_alert_state.json')
+WATCHLIST_FILE = os.path.join(DATA_DIR, 'watchlist.json')
 # Telegram alerts only start firing from this IST time onward (skips the
 # noisy pre-open / opening-auction minutes).
 ALERT_START_TIME = datetime.strptime("09:30", "%H:%M").time()
@@ -194,6 +195,154 @@ def save_trigger_alert_state(keys):
             json.dump(data, f)
     except:
         pass
+# ============================================================
+# WATCH LIST
+#
+# A small persisted list of options the user has explicitly starred from
+# the Monthly / Weekly tables (via the "Add to Watch List" picker above
+# each CE/PE table). UNLIKE the LTP cache / trigger-alert state above,
+# this is NOT date-scoped at all - it does not reset at the start of a
+# new trading day, does not care about expiry, and survives every refresh
+# and every rerun. The ONLY thing that empties it is clicking "Clear All"
+# on the Watch List tab (or removing one row at a time there). Each entry
+# snapshots the Symbol/Strike/OptionType/Trigger it had at the moment it
+# was watched, plus its instrument_key, so the Watch List tab can render
+# live LTP / change% exactly like the Monthly and Weekly tables, with its
+# own independent Telegram alert, without needing NSE.json or an IV Excel
+# at render time.
+#
+# Note: this JSON file lives on local disk (data/watchlist.json). It will
+# survive as long as this app's underlying storage survives — on
+# Streamlit Community Cloud specifically, a full app reboot/redeploy can
+# wipe local disk, which is most likely why an older version of this list
+# looked like it was "resetting every day". There's no code-level fix for
+# that; if this matters, back the Watch List with a small external store
+# (e.g. a Google Sheet or a tiny hosted DB) instead of a local JSON file.
+# ============================================================
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+def save_watchlist(items):
+    try:
+        with open(WATCHLIST_FILE, 'w') as f:
+            json.dump(items, f)
+    except:
+        pass
+def add_watchlist_item(item):
+    """
+    Adds one option to the persisted Watch List, de-duplicated by
+    instrument_key. Returns True if it was newly added, False if that
+    instrument was already on the list (nothing changed).
+    """
+    items = load_watchlist()
+    if any(str(it.get('instrument_key')) == str(item.get('instrument_key')) for it in items):
+        return False
+    items.append(item)
+    save_watchlist(items)
+    return True
+def remove_watchlist_item(instrument_key):
+    items = load_watchlist()
+    items = [it for it in items if str(it.get('instrument_key')) != str(instrument_key)]
+    save_watchlist(items)
+def process_watchlist():
+    """
+    Builds the Watch List's own OTM-style dataframe straight from the
+    persisted watchlist.json. Each entry already carries its resolved
+    instrument_key and its snapshotted Trigger, so - unlike
+    process_iv_excel - this needs no NSE.json lookup or Excel parse at
+    render time; the result has the exact same shape (Symbol, StrikePrice,
+    OptionType, instrument_key, Trigger) that display_option_chain already
+    knows how to render.
+    """
+    cols = ['Symbol', 'StrikePrice', 'OptionType', 'instrument_key', 'Trigger']
+    items = load_watchlist()
+    if not items:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(items)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols].reset_index(drop=True)
+def render_add_to_watchlist_selector(data_df, key_suffix, leg_label):
+    """
+    A stock-picker (selectbox) + "Add" button placed ABOVE the Monthly /
+    Weekly CE/PE table, used to star an option onto the Watch List tab.
+    """
+    if data_df.empty:
+        st.caption("No rows available.")
+        return
+    options = list(data_df.index)
+    def _fmt(idx):
+        row = data_df.loc[idx]
+        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
+    sel_col, btn_col = st.columns([4, 1])
+    with sel_col:
+        chosen_idx = st.selectbox(
+            "Add to Watch List",
+            options=options,
+            format_func=_fmt,
+            key=f"{key_suffix}_{leg_label}_watch_add_select",
+            label_visibility="collapsed"
+        )
+    with btn_col:
+        add_clicked = st.button("👁️ Add to Watch", key=f"{key_suffix}_{leg_label}_watch_add_btn", width='stretch')
+    if add_clicked and chosen_idx is not None:
+        row = data_df.loc[chosen_idx]
+        inst_key = row.get('instrument_key')
+        if not inst_key or pd.isna(inst_key):
+            st.toast("Cannot watch — missing instrument key.", icon="⚠️")
+            return
+        added = add_watchlist_item({
+            'source': key_suffix,
+            'Symbol': row['Symbol'],
+            'OptionType': row['OptionType'],
+            'StrikePrice': float(row['StrikePrice']),
+            'Trigger': float(row['Trigger']),
+            'instrument_key': str(inst_key),
+        })
+        if added:
+            st.toast(f"Added to Watch List: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="👁️")
+        else:
+            st.toast(f"Already in Watch List: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="ℹ️")
+        # Plain st.rerun() from inside a fragment triggers a full-app rerun
+        # (not just this fragment) - needed so the Watch List tab's own
+        # fragment picks up the new entry immediately instead of waiting
+        # for its next auto-refresh tick.
+        st.rerun()
+def render_remove_from_watchlist_selector(data_df, leg_label):
+    """
+    A stock-picker (selectbox) + "Remove" button placed ABOVE the Watch
+    List tab's own CE/PE table, used to drop an option back off the list.
+    """
+    if data_df.empty:
+        st.caption("Watch List is empty for this leg.")
+        return
+    options = list(data_df.index)
+    def _fmt(idx):
+        row = data_df.loc[idx]
+        return f"{row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']} — LTP {row['ltp']:.2f} ({row['change %']:.1f}%)"
+    sel_col, btn_col = st.columns([4, 1])
+    with sel_col:
+        chosen_idx = st.selectbox(
+            "Remove from Watch List",
+            options=options,
+            format_func=_fmt,
+            key=f"watch_{leg_label}_remove_select",
+            label_visibility="collapsed"
+        )
+    with btn_col:
+        remove_clicked = st.button("🗑️ Remove", key=f"watch_{leg_label}_remove_btn", width='stretch')
+    if remove_clicked and chosen_idx is not None:
+        row = data_df.loc[chosen_idx]
+        inst_key = row.get('instrument_key')
+        remove_watchlist_item(inst_key)
+        st.toast(f"Removed from Watch List: {row['Symbol']} {row['StrikePrice']:.0f} {row['OptionType']}", icon="🗑️")
+        st.rerun()
 @st.cache_resource
 def _get_telegram_session():
     # A reused, persistent connection (kept alive across fragment reruns via
@@ -222,10 +371,10 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     Sends a Telegram alert the moment an option's change % (LTP vs Trigger)
     reaches threshold_pct (default 85, i.e. 85% of the way to Trigger — not
     only a full 100% cross). Fires once per option per day.
-    key_suffix ("Monthly" or "Weekly") picks the bot_token/chat_id this
-    call was given, so each section's alerts are fully independent — every
-    section sends its own message to its own configured bot/chat, never
-    combined with another section's rows.
+    key_suffix ("Monthly", "Weekly" or "Watchlist") picks the
+    bot_token/chat_id this call was given, so each section's alerts are
+    fully independent — every section sends its own message to its own
+    configured bot/chat, never combined with another section's rows.
     Alerts are suppressed before ALERT_START_TIME (09:30 IST) so the noisy
     opening minutes don't spam Telegram — but crucially, anything already
     at/above threshold_pct *before* 09:30 is silently marked as "seen"
@@ -285,7 +434,7 @@ def check_and_alert_triggers(df, key_suffix, telegram_enabled, bot_token, chat_i
     if success:
         save_trigger_alert_state(alerted)
         # st.toast (not st.sidebar.success/warning): this function runs inside an
-        # @st.fragment (show_monthly/show_weekly). Writing to
+        # @st.fragment (show_monthly/show_weekly/show_watchlist). Writing to
         # st.sidebar - a container outside the fragment's own tree - from
         # inside a fragment raises StreamlitAPIException ("container was not
         # written to during the initial run") and aborts the fragment
@@ -422,10 +571,13 @@ def fetch_ltp(instrument_keys, token):
             except Exception:
                 pass
     return ltp_map
-def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar."):
+def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegram_enabled=False, telegram_bot_token="", telegram_chat_id="", alert_threshold_pct=85, empty_message="No data to display. Please upload a valid Monthly IV Excel in the sidebar.", show_add_to_watchlist=False, show_remove_from_watchlist=False):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
-        st.info(empty_message)
+        if key_suffix == "Watchlist":
+            st.info("Your Watch List is empty. Use the '👁️ Add to Watch' picker above the Monthly / Weekly CE/PE tables to star options here.")
+        else:
+            st.info(empty_message)
         return
     # Fetch LTP if token provided
     if access_token:
@@ -476,8 +628,9 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
         st.info("No rows with Trigger price ≥ ₹3.")
         return
     # --- Telegram Trigger Alerts (>= alert_threshold_pct, only from 09:30 IST) ---
-    # bot_token/chat_id passed in are section-specific (Monthly vs Weekly),
-    # so each section's alerts go to its own configured Telegram bot/chat.
+    # bot_token/chat_id passed in are section-specific (Monthly vs Weekly vs
+    # Watchlist), so each section's alerts go to its own configured
+    # Telegram bot/chat.
     check_and_alert_triggers(df, key_suffix, telegram_enabled, telegram_bot_token, telegram_chat_id, alert_threshold_pct)
     # Split Upper Strike (CE) / Lower Strike (PE)
     calls_df = df[df['OptionType'] == 'CE'].copy()
@@ -485,7 +638,8 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     calls_df = calls_df.sort_values(by='change %', ascending=False)
     puts_df = puts_df.sort_values(by='change %', ascending=False)
     # TGT/SL are still computed upstream but intentionally left out of the
-    # displayed table below, on both tabs since they share this function.
+    # displayed table below, on all three tabs since they share this
+    # function.
     display_cols = ['Symbol', 'StrikePrice', 'ltp', 'Trigger', 'change %']
     def color_change(val):
         # Fixed two-tier coloring (no graduated/ascending scale):
@@ -514,6 +668,10 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col1:
         st.subheader("Upper Strike (CE)")
         calls_df = calls_df.sort_values(by='change %', ascending=False)
+        if show_add_to_watchlist:
+            render_add_to_watchlist_selector(calls_df, key_suffix, "CE")
+        if show_remove_from_watchlist:
+            render_remove_from_watchlist_selector(calls_df, "CE")
         st.dataframe(
             render_table(calls_df),
             hide_index=True,
@@ -523,6 +681,10 @@ def display_option_chain(df, access_token, key_suffix, expiry_date=None, telegra
     with col2:
         st.subheader("Lower Strike (PE)")
         puts_df = puts_df.sort_values(by='change %', ascending=False)
+        if show_add_to_watchlist:
+            render_add_to_watchlist_selector(puts_df, key_suffix, "PE")
+        if show_remove_from_watchlist:
+            render_remove_from_watchlist_selector(puts_df, "PE")
         st.dataframe(
             render_table(puts_df),
             hide_index=True,
@@ -555,9 +717,9 @@ if is_client_view:
     """, unsafe_allow_html=True)
     auto_refresh = True
     refresh_interval = 15
-    # Monthly and Weekly each get their own bot/chat, falling back to the
-    # shared TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / ALERT_THRESHOLD_PCT
-    # secrets if a section-specific one isn't set.
+    # Monthly, Weekly and Watch List each get their own bot/chat, falling
+    # back to the shared TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID /
+    # ALERT_THRESHOLD_PCT secrets if a section-specific one isn't set.
     monthly_telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN_MONTHLY", st.secrets.get("TELEGRAM_BOT_TOKEN", ""))
     monthly_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_MONTHLY", st.secrets.get("TELEGRAM_CHAT_ID", ""))
     monthly_telegram_enabled = bool(monthly_telegram_bot_token and monthly_telegram_chat_id)
@@ -566,6 +728,10 @@ if is_client_view:
     weekly_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_WEEKLY", st.secrets.get("TELEGRAM_CHAT_ID", ""))
     weekly_telegram_enabled = bool(weekly_telegram_bot_token and weekly_telegram_chat_id)
     weekly_alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT_WEEKLY", st.secrets.get("ALERT_THRESHOLD_PCT", 85.0)))
+    watchlist_telegram_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN_WATCHLIST", st.secrets.get("TELEGRAM_BOT_TOKEN", ""))
+    watchlist_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID_WATCHLIST", st.secrets.get("TELEGRAM_CHAT_ID", ""))
+    watchlist_telegram_enabled = bool(watchlist_telegram_bot_token and watchlist_telegram_chat_id)
+    watchlist_alert_threshold_pct = float(st.secrets.get("ALERT_THRESHOLD_PCT_WATCHLIST", st.secrets.get("ALERT_THRESHOLD_PCT", 85.0)))
 else:
     with st.sidebar:
         st.header("Configuration")
@@ -587,11 +753,11 @@ else:
         st.caption("🕤 Alerts are silent before 09:30 AM IST, then active for the rest of the day.")
         def render_telegram_section(section_prefix, section_label, alert_key=None):
             """
-            Renders one section's (Monthly / Weekly) independent Telegram
-            config: its own enable checkbox, threshold, bot token, chat ID
-            and test button - so every section's alerts can go to a
-            completely different Telegram bot/chat and never get mixed
-            into the same message.
+            Renders one section's (Monthly / Weekly / Watch List)
+            independent Telegram config: its own enable checkbox,
+            threshold, bot token, chat ID and test button - so every
+            section's alerts can go to a completely different Telegram
+            bot/chat and never get mixed into the same message.
             alert_key is the internal key_suffix this section's rows are
             tagged with (defaults to section_label) - it's what the
             dedup-reset filter and check_and_alert_triggers actually match
@@ -632,9 +798,10 @@ else:
             test_clicked = tg_col1.button("Send Test", use_container_width=True, key=f'{section_prefix}_test_btn')
             reset_clicked = tg_col2.button("Reset Alerts", use_container_width=True, key=f'{section_prefix}_reset_btn')
             if reset_clicked:
-                # Alert-dedup keys are namespaced "Monthly:..."/"Weekly:...",
-                # so only this section's already-triggered options are
-                # cleared - the other section's alert history is untouched.
+                # Alert-dedup keys are namespaced "Monthly:..."/"Weekly:..."/
+                # "Watchlist:...", so only this section's already-triggered
+                # options are cleared - the other sections' alert history is
+                # untouched.
                 alerted = load_trigger_alert_state()
                 remaining = {k for k in alerted if not k.startswith(f"{alert_key}:")}
                 save_trigger_alert_state(remaining)
@@ -653,6 +820,8 @@ else:
         monthly_telegram_enabled, monthly_telegram_bot_token, monthly_telegram_chat_id, monthly_alert_threshold_pct = render_telegram_section('monthly', 'Monthly')
         st.markdown("---")
         weekly_telegram_enabled, weekly_telegram_bot_token, weekly_telegram_chat_id, weekly_alert_threshold_pct = render_telegram_section('weekly', 'Weekly')
+        st.markdown("---")
+        watchlist_telegram_enabled, watchlist_telegram_bot_token, watchlist_telegram_chat_id, watchlist_alert_threshold_pct = render_telegram_section('watchlist', 'Watch List', alert_key='Watchlist')
         st.markdown("---")
         st.header("Data Management")
         if st.button("⚡ Refresh LTP Now", use_container_width=True):
@@ -779,7 +948,7 @@ def get_target_expiry(meta_expiry_key):
             return None
     return None
 if not nse_json_df.empty:
-    tab_monthly, tab_weekly = st.tabs(["📅 Monthly", "🗓️ Weekly"])
+    tab_monthly, tab_weekly, tab_watchlist = st.tabs(["📅 Monthly", "🗓️ Weekly", "👁️ Watch List"])
     with tab_monthly:
         st.header("Monthly Options")
         target_expiry_m = get_target_expiry('MonthlyIVExpiry')
@@ -789,7 +958,7 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_monthly():
                 df_m = process_iv_excel(MONTHLY_IV_FILE, nse_json_df, target_expiry_m)
-                display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=monthly_telegram_enabled, telegram_bot_token=monthly_telegram_bot_token, telegram_chat_id=monthly_telegram_chat_id, alert_threshold_pct=monthly_alert_threshold_pct)
+                display_option_chain(df_m, access_token, "Monthly", expiry_date=target_expiry_m, telegram_enabled=monthly_telegram_enabled, telegram_bot_token=monthly_telegram_bot_token, telegram_chat_id=monthly_telegram_chat_id, alert_threshold_pct=monthly_alert_threshold_pct, show_add_to_watchlist=True)
             show_monthly()
         else:
             st.warning("Monthly IV Excel file not found. Please upload it in the sidebar.")
@@ -802,9 +971,27 @@ if not nse_json_df.empty:
             @st.fragment(run_every=run_every)
             def show_weekly():
                 df_w = process_iv_excel(WEEKLY_IV_FILE, nse_json_df, target_expiry_w)
-                display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=weekly_telegram_enabled, telegram_bot_token=weekly_telegram_bot_token, telegram_chat_id=weekly_telegram_chat_id, alert_threshold_pct=weekly_alert_threshold_pct)
+                display_option_chain(df_w, access_token, "Weekly", expiry_date=target_expiry_w, telegram_enabled=weekly_telegram_enabled, telegram_bot_token=weekly_telegram_bot_token, telegram_chat_id=weekly_telegram_chat_id, alert_threshold_pct=weekly_alert_threshold_pct, show_add_to_watchlist=True)
             show_weekly()
         else:
             st.warning("Weekly IV Excel file not found. Please upload it in the sidebar.")
+    with tab_watchlist:
+        header_col1, header_col2 = st.columns([5, 1])
+        with header_col1:
+            st.header("Watch List")
+            st.caption("Stays here forever across refreshes, reruns and new uploads — only 'Clear All' (or removing one row) empties it.")
+        with header_col2:
+            st.write("")  # vertical spacer to align the button with the header
+            wl_items = load_watchlist()
+            if st.button("🧹 Clear All", key="clear_watchlist_btn", width='stretch', disabled=not wl_items):
+                save_watchlist([])
+                st.toast("Watch List cleared.", icon="🧹")
+                st.rerun()
+        run_every = refresh_interval if auto_refresh else None
+        @st.fragment(run_every=run_every)
+        def show_watchlist():
+            df_wl = process_watchlist()
+            display_option_chain(df_wl, access_token, "Watchlist", expiry_date=None, telegram_enabled=watchlist_telegram_enabled, telegram_bot_token=watchlist_telegram_bot_token, telegram_chat_id=watchlist_telegram_chat_id, alert_threshold_pct=watchlist_alert_threshold_pct, show_add_to_watchlist=False, show_remove_from_watchlist=True)
+        show_watchlist()
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
